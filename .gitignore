@@ -1,0 +1,7 @@
+downstream_results/
+all_results/
+lsnet_model/
+L-LSTrans(Hetero).pdf
+L-LSTrans(Homo).pdf
+LSTrans_framework.pdf
+LSTrans_KD_config.pdf

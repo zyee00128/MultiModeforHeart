@@ -1,0 +1,12 @@
+/home/xcy/yes/envs/lsm/bin/python /home/xcy/zy/LSnet4ECG/main.py \
+    --tea_ranklist lora_ave \
+    --model_config light \
+    --device cuda:5 \
+    --preload_devices cuda:5 cuda:3 cuda:2 cuda:1 cuda:0\
+    --batch_size 64 \
+    --conv_r 4 \
+    --trans_r 16 \
+    --patience 30 \
+    --kd_temperature 9.0 \
+    --kd_alpha 0.9 \
+    --task kfold_exp
