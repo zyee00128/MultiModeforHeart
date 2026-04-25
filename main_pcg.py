@@ -52,11 +52,6 @@ def pretrain_main(args):
     """
     PCG 预训练主函数
     """
-    expected_save_dir = os.path.join(args.root, 'checkpoints', 'pcg_pretrain')
-    os.makedirs(expected_save_dir, exist_ok=True)
-    
-    expected_filename = f"CirCor_Pretrain_{args.model_config}_checkpoint.pt"
-    expected_save_path = os.path.join(expected_save_dir, expected_filename)
 
     print("\n" + "="*50)
     print("           LSTransPCG Pretraining (CirCor)      ")
@@ -68,14 +63,13 @@ def pretrain_main(args):
     print(f"Batch Size   : {args.batch_size}")
     print(f"Signal Len   : {args.pcg_len}")
     print(f"Data Path    : {args.pcg_data_path}")
-    print(f"Save Path    : {expected_save_path}") 
     print("="*50 + "\n")
 
     setup_seed(args.seed)
 
     try:
         Large_model_pretraining(args)
-        print(f"\n[Success] Pretraining completed. Model saved at {expected_save_path}")
+        print(f"\n[Success] Pretraining completed.")
     except Exception as e:
         print(f"\n[Error] Pretraining failed: {e}")
         raise e

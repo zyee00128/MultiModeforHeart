@@ -375,6 +375,9 @@ class NN_default(nn.Module): ## backbone model definition
         return 
     
     def feature_extraction(self, x, semi_flag = False):
+        if x.dim() == 3:
+            x = x.unsqueeze(2)
+
         for layer in self.encoder_layers:
             x = layer(x)
         if semi_flag:
@@ -397,7 +400,8 @@ class NN_default(nn.Module): ## backbone model definition
 class NN_PCG(nn.Module):
     def __init__(self, nOUT, complexity, inputchannel, input_length,
                  num_layers=35, rank_list=32, information='fisher', 
-                 num_encoder_layers=3, dropout_coef=0.2, loc_dim=5, pos_max_len=1000):
+                 num_encoder_layers=3, dropout_coef=0.2, 
+                 loc_dim=5, pos_max_len=1000):
         super(NN_PCG, self).__init__()
         
         self.num_classifier_layers = 2
@@ -458,21 +462,19 @@ class NN_PCG(nn.Module):
             if hasattr(layer, 'r') and layer.r > 0:
                 layer.merge()
     
-    def forward(self, x, loc):
+    def feature_extraction(self, x,loc):
         # x: [Batch, Channel, Length] -> NN_default: [Batch, Channel, 1, Length]
         if x.dim() == 3:
             x = x.unsqueeze(2)
-        
         # 提取信号特征 [Batch, complexity]
         sig_feat = self.backbone.feature_extraction(x)
-        
         # 提取位置特征 [Batch, 16]
         loc_feat = self.loc_branch(loc)
-        
         # 特征拼接
         combined = torch.cat([sig_feat, loc_feat], dim=1)
-        
-        out = combined
+        return combined
+    def forward(self, x, loc):
+        out = self.feature_extraction(x,loc)
         for layer in self.classifier:
             out = layer(out)
         return out
@@ -639,8 +641,10 @@ class LSTransECG(nn.Module):
     def network_rank_state_reset(self):
         self.backbone.network_rank_state_reset()
 
+    def feature_extraction(self, x):
+        return self.backbone(x) 
     def forward(self, x):
-        x = self.backbone(x)
+        x = self.feature_extraction(x)
         for layer in self.classifier:
             x = layer(x)
         return x
@@ -706,14 +710,186 @@ class LSTransPCG(nn.Module):
     def network_rank_state_reset(self):
         self.backbone.network_rank_state_reset()
 
-    def forward(self, x, loc):
+    def feature_extraction(self, x, loc):
         sig_feat = self.backbone(x) # [Batch, out_channels]
-
         loc_feat = self.loc_branch(loc) # [Batch, 16]
-
         combined = torch.cat([sig_feat, loc_feat], dim=1) # [Batch, out_channels + 16]
-        
-        out = combined
+        return combined
+    def forward(self, x, loc):
+        out = self.feature_extraction(x, loc)
         for layer in self.classifier:
             out = layer(out)
         return out
+
+class AlignmentLayer(nn.Module):
+    def __init__(self, ecg_dim, pcg_dim):
+        super(AlignmentLayer, self).__init__()
+        # TODO: 在此实现你的多模态对齐机制（例如 Cross-Attention, 对比学习投影头等）
+        pass
+        
+    def forward(self, ecg_feat, pcg_feat):
+        # TODO: 填入特征对齐代码，此处先原样返回空出位置
+        return ecg_feat, pcg_feat
+class MultimodalStudentNet(nn.Module):
+    def __init__(self, nOUT, ecg_complexity, pcg_complexity,
+                 ecg_inchannels, pcg_inchannels, input_length,
+                 num_layers,num_encoder_layers=1,
+                 rank_list=32,information='fisher',
+                 use_static_conv=False,
+                 dropout_coef=0.2,loc_dim=5):
+        super(MultimodalStudentNet, self).__init__()
+
+        if isinstance(rank_list, int):
+            self.rank_list = (np.zeros(num_layers) + rank_list).astype(int)
+        else:
+            self.rank_list = rank_list
+
+        # 独立提取 ECG 和 PCG 特征的 Backbone
+        self.ecg_encoder = LSTransECG(nOUT, ecg_complexity, 
+                                           ecg_inchannels, 
+                                           input_length, 
+                                           num_layers, num_encoder_layers, 
+                                           rank_list, information,
+                                           use_static_conv,
+                                           dropout_coef,pos_max_len=200)
+        self.pcg_encoder = LSTransPCG(nOUT,pcg_complexity, 
+                                           pcg_inchannels, 
+                                           input_length, 
+                                           num_layers, num_encoder_layers, 
+                                           rank_list, information,
+                                           use_static_conv,
+                                           dropout_coef,loc_dim,
+                                           pos_max_len=1000)
+        
+        # 对齐层
+        self.alignment = AlignmentLayer(ecg_complexity, pcg_complexity)
+        
+        # 对齐后的联合分类器
+        fusion_dim = ecg_complexity + pcg_complexity
+        self.classifier = nn.Sequential(
+            nn.Linear(fusion_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.LeakyReLU(0.1),
+            nn.Linear(128, nOUT)
+        )
+
+    def compute_grad(self):
+        grads = []
+        grads.extend(self.ecg_encoder.compute_grad())
+        grads.extend(self.pcg_encoder.compute_grad())
+        return grads
+
+    def merge_net(self):
+        self.ecg_encoder.merge_net()
+        self.pcg_encoder.merge_net()
+        for layer in self.classifier:
+            if layer.r > 0:
+                layer.merge()
+
+    def freeze_A_grad(self):
+        self.ecg_encoder.freeze_A_grad()
+        self.pcg_encoder.freeze_A_grad()
+        for layer in self.classifier:
+            if hasattr(layer, 'lora_A'):
+                layer.lora_A.requires_grad = False
+
+    def network_rank_state_reset(self):
+        self.ecg_encoder.network_rank_state_reset()
+        self.pcg_encoder.network_rank_state_reset()
+
+    def forward(self, ecg_x, pcg_x, pcg_loc):
+        # 独立提取特征
+        ecg_feat = self.ecg_encoder.feature_extraction(ecg_x)  # [Batch, ecg_complexity]
+        pcg_feat = self.pcg_encoder.feature_extraction(pcg_x, pcg_loc)  # [Batch, pcg_complexity]
+        
+        # 送入对齐层进行对齐
+        ecg_feat_aligned, pcg_feat_aligned = self.alignment(ecg_feat, pcg_feat)
+        
+        # 融合与分类
+        fused_feat = torch.cat([ecg_feat_aligned, pcg_feat_aligned], dim=1)
+        out = self.classifier(fused_feat)
+        
+        # 如果需要特征蒸馏，可以将中间对齐后的特征一并返回
+        return out, ecg_feat_aligned, pcg_feat_aligned, fused_feat
+class Hetero_MultimodalTeacherNet(nn.Module):
+    def __init__(self, nOUT, ecg_complexity, pcg_complexity,
+                 ecg_inchannels, pcg_inchannels, input_length,
+                 num_layers=35, rank_list=32, information='fisher', 
+                 num_encoder_layers=3, dropout_coef=0.2, 
+                 loc_dim=5):
+        super(Hetero_MultimodalTeacherNet,self).__init__()
+
+        if isinstance(rank_list, int):
+            self.rank_list = (np.zeros(num_layers) + rank_list).astype(int)
+        else:
+            self.rank_list = rank_list
+
+        self.ecg_encoder = NN_default(nOUT,ecg_complexity,
+                                    ecg_inchannels,
+                                    num_layers,
+                                    rank_list,information,
+                                    num_encoder_layers,
+                                    dropout_coef,pos_max_len=200)
+        self.pcg_encoder = NN_PCG(nOUT, pcg_complexity, 
+                                pcg_inchannels,
+                                num_layers, 
+                                rank_list, information, 
+                                num_encoder_layers, dropout_coef, 
+                                loc_dim, pos_max_len=1000)
+        
+        # 对齐层
+        self.alignment = AlignmentLayer(ecg_complexity, pcg_complexity)
+        
+        # 对齐后的联合分类器
+        fusion_dim = ecg_complexity + pcg_complexity
+        self.classifier = nn.Sequential(
+            nn.Linear(fusion_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.LeakyReLU(0.1),
+            nn.Linear(128, nOUT)
+        )
+
+    def compute_grad(self):
+        grads = []
+        grads.extend(self.ecg_encoder.compute_grad())
+        grads.extend(self.pcg_encoder.compute_grad())
+        return grads
+
+    def merge_net(self):
+        self.ecg_encoder.merge_net()
+        self.pcg_encoder.merge_net()
+        for layer in self.classifier:
+            if layer.r > 0:
+                layer.merge()
+
+    def freeze_A_grad(self):
+        self.ecg_encoder.freeze_A_grad()
+        self.pcg_encoder.freeze_A_grad()
+        for layer in self.classifier:
+            if hasattr(layer, 'lora_A'):
+                layer.lora_A.requires_grad = False
+
+    def network_rank_state_reset(self):
+        self.ecg_encoder.network_rank_state_reset()
+        self.pcg_encoder.network_rank_state_reset()
+
+    def forward(self, ecg_x, pcg_x, pcg_loc):
+        if ecg_x.dim() == 3:
+            ecg_x = ecg_x.unsqueeze(2)
+        if pcg_x.dim() == 3:
+            pcg_x = pcg_x.unsqueeze(2)
+
+        # 独立提取特征
+        ecg_feat = self.ecg_encoder.feature_extraction(ecg_x)  # [Batch, ecg_complexity]
+        pcg_feat = self.pcg_encoder.feature_extraction(pcg_x, pcg_loc)  # [Batch, pcg_complexity]
+        
+        # 送入对齐层进行对齐
+        ecg_feat_aligned, pcg_feat_aligned = self.alignment(ecg_feat, pcg_feat)
+        
+        # 融合与分类
+        fused_feat = torch.cat([ecg_feat_aligned, pcg_feat_aligned], dim=1)
+        out = self.classifier(fused_feat)
+        
+        # 如果需要特征蒸馏，可以将中间对齐后的特征一并返回
+        return out, ecg_feat_aligned, pcg_feat_aligned, fused_feat
+
