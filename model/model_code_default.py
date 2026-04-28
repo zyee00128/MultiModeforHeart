@@ -388,12 +388,12 @@ class NN_default(nn.Module): ## backbone model definition
         for layer in self.transformer_layers:
             x = layer(x)
         x = x.permute(0, 2, 1)
-        x = self.pool(x).squeeze(2)
+        
         return x
 
     def forward(self, x, semi_flag = False):
         x = self.feature_extraction(x, semi_flag)
-
+        x = self.pool(x).squeeze(2)
         for layer in self.classifier:
             x = layer(x)
         return x
@@ -466,15 +466,18 @@ class NN_PCG(nn.Module):
         # x: [Batch, Channel, Length] -> NN_default: [Batch, Channel, 1, Length]
         if x.dim() == 3:
             x = x.unsqueeze(2)
-        # 提取信号特征 [Batch, complexity]
+        # 提取信号特征 [Batch, complexity, Seq_len]
         sig_feat = self.backbone.feature_extraction(x)
         # 提取位置特征 [Batch, 16]
         loc_feat = self.loc_branch(loc)
+        seq_len = sig_feat.size(2)
+        loc_feat = loc_feat.unsqueeze(2).expand(-1, -1, seq_len)
         # 特征拼接
-        combined = torch.cat([sig_feat, loc_feat], dim=1)
+        combined = torch.cat([sig_feat, loc_feat], dim=1)  # [Batch, complexity + 16, Seq_len]
         return combined
     def forward(self, x, loc):
         out = self.feature_extraction(x,loc)
+        x = self.pool(x).squeeze(2)
         for layer in self.classifier:
             out = layer(out)
         return out
@@ -576,13 +579,13 @@ class LSTrans_default(nn.Module):
         
         # x shape: [Batch, Seq_len, out_channels]
         x = x.permute(0, 2, 1) # [Batch, out_channels, Seq_len]
-        x = self.pool(x).squeeze(2)
         return x
 
     def forward(self, x):
         x = self.feature_extraction(x)
-        # for layer in self.classifier:
-        #     x = layer(x)
+        x = self.pool(x).squeeze(2)
+        for layer in self.classifier:
+            x = layer(x)
         return x
 class LSTransECG(nn.Module):
     def __init__(self,nOUT,out_channels,in_channels,input_length,
@@ -616,7 +619,8 @@ class LSTransECG(nn.Module):
             Linear(out_channels, nOUT, r=0, merge_weights=False, 
                    information=information, dropout_coef=dropout_coef)
         ])
-        
+
+        self.pool = nn.AdaptiveMaxPool1d(output_size=1)
     def compute_grad(self):
         grad_list = []
         if hasattr(self.backbone, 'compute_grad'):
@@ -645,6 +649,7 @@ class LSTransECG(nn.Module):
         return self.backbone(x) 
     def forward(self, x):
         x = self.feature_extraction(x)
+        x = self.pool(x).squeeze(2)
         for layer in self.classifier:
             x = layer(x)
         return x
@@ -713,31 +718,62 @@ class LSTransPCG(nn.Module):
     def feature_extraction(self, x, loc):
         sig_feat = self.backbone(x) # [Batch, out_channels]
         loc_feat = self.loc_branch(loc) # [Batch, 16]
-        combined = torch.cat([sig_feat, loc_feat], dim=1) # [Batch, out_channels + 16]
+        seq_len = sig_feat.size(2)
+        loc_feat = loc_feat.unsqueeze(2).expand(-1, -1, seq_len)
+        combined = torch.cat([sig_feat, loc_feat], dim=2) # [Batch, out_channels + 16, Seq_len]
         return combined
     def forward(self, x, loc):
         out = self.feature_extraction(x, loc)
+        x = self.pool(x).squeeze(2)
         for layer in self.classifier:
             out = layer(out)
         return out
 
-class AlignmentLayer(nn.Module):
-    def __init__(self, ecg_dim, pcg_dim):
-        super(AlignmentLayer, self).__init__()
-        # TODO: 在此实现你的多模态对齐机制（例如 Cross-Attention, 对比学习投影头等）
-        pass
+class TemporalAttentionAlignmentLayer(nn.Module):
+    def __init__(self, ecg_dim, pcg_dim, align_dim=128):
+        super(TemporalAttentionAlignmentLayer, self).__init__() # 1. 维度对齐：使用 1x1 卷积将通道数统一到 align_dim，方便后续做 Attention
+        self.ecg_proj = nn.Conv1d(ecg_dim, align_dim, kernel_size=1)
+        self.pcg_proj = nn.Conv1d(pcg_dim, align_dim, kernel_size=1)
+        
+        # 2. 时序交叉注意力层 (Temporal Cross-Attention)
+        self.cross_attn = nn.MultiheadAttention(embed_dim=align_dim, num_heads=4, batch_first=True)
+        self.norm = nn.LayerNorm(align_dim)
+        
+        # 3. 延迟全局池化层 (在这里把时序压平)
+        self.pool = nn.AdaptiveMaxPool1d(output_size=1)
         
     def forward(self, ecg_feat, pcg_feat):
-        # TODO: 填入特征对齐代码，此处先原样返回空出位置
-        return ecg_feat, pcg_feat
-class MultimodalStudentNet(nn.Module):
+        # 输入形状: [Batch, Channel, Seq_len]
+        
+        # --- 映射到统一维度 ---
+        ecg_mapped = self.ecg_proj(ecg_feat) # [Batch, align_dim, Seq_len_ECG]
+        pcg_mapped = self.pcg_proj(pcg_feat) #[Batch, align_dim, Seq_len_PCG]
+        
+        # --- 维度重排，满足 MultiheadAttention (要求[Batch, Seq_len, Embed_dim]) ---
+        ecg_q = ecg_mapped.permute(0, 2, 1)
+        pcg_kv = pcg_mapped.permute(0, 2, 1)
+        
+        # --- 交叉时序注意力 (用ECG找PCG对应的位置) ---
+        attn_out, _ = self.cross_attn(query=ecg_q, key=pcg_kv, value=pcg_kv)
+        
+        # 残差融合加归一化
+        ecg_aligned = self.norm(ecg_q + attn_out) #[Batch, Seq_len_ECG, align_dim]
+        
+        # --- 延迟池化：恢复 [Batch, Channel, Seq_len] 并压缩时序 ---
+        ecg_pooled = self.pool(ecg_aligned.permute(0, 2, 1)).squeeze(2) # [Batch, align_dim]
+        pcg_pooled = self.pool(pcg_mapped).squeeze(2)                   # [Batch, align_dim]
+        
+        # 返回的是两个融合过的一维特征，供分类器或对比损失使用
+        return ecg_pooled, pcg_pooled
+    
+class MultimodalLSTransNet(nn.Module):
     def __init__(self, nOUT, ecg_complexity, pcg_complexity,
                  ecg_inchannels, pcg_inchannels, input_length,
                  num_layers,num_encoder_layers=1,
                  rank_list=32,information='fisher',
                  use_static_conv=False,
                  dropout_coef=0.2,loc_dim=5):
-        super(MultimodalStudentNet, self).__init__()
+        super(MultimodalLSTransNet, self).__init__()
 
         if isinstance(rank_list, int):
             self.rank_list = (np.zeros(num_layers) + rank_list).astype(int)
@@ -761,11 +797,13 @@ class MultimodalStudentNet(nn.Module):
                                            dropout_coef,loc_dim,
                                            pos_max_len=1000)
         
-        # 对齐层
-        self.alignment = AlignmentLayer(ecg_complexity, pcg_complexity)
-        
-        # 对齐后的联合分类器
-        fusion_dim = ecg_complexity + pcg_complexity
+    
+        # 对齐层 和 联合分类器
+        ecg_dim = ecg_complexity
+        pcg_dim = pcg_complexity + 16
+        self.alignment = TemporalAttentionAlignmentLayer(ecg_dim, pcg_dim, align_dim=128)
+
+        fusion_dim = 256
         self.classifier = nn.Sequential(
             nn.Linear(fusion_dim, 128),
             nn.BatchNorm1d(128),
@@ -837,11 +875,12 @@ class Hetero_MultimodalTeacherNet(nn.Module):
                                 num_encoder_layers, dropout_coef, 
                                 loc_dim, pos_max_len=1000)
         
-        # 对齐层
-        self.alignment = AlignmentLayer(ecg_complexity, pcg_complexity)
-        
-        # 对齐后的联合分类器
-        fusion_dim = ecg_complexity + pcg_complexity
+        # 对齐层 和 联合分类器
+        ecg_dim = ecg_complexity
+        pcg_dim = pcg_complexity + 16
+        self.alignment = TemporalAttentionAlignmentLayer(ecg_dim, pcg_dim, align_dim=128)
+
+        fusion_dim = 256
         self.classifier = nn.Sequential(
             nn.Linear(fusion_dim, 128),
             nn.BatchNorm1d(128),

@@ -6,3 +6,5 @@ L-LSTrans(Homo).pdf
 LSTrans_framework.pdf
 LSTrans_KD_config.pdf
 pipeline_multimodel.py
+ECG_checkpoints/
+PCG_checkpoints/
