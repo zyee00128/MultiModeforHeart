@@ -136,7 +136,6 @@ def Cutmix_ECG_student(x, y, device, alpha=0.75, valid_lead_num=12):
         x_mix = x
 
     return x_mix, y_mixed
-
 def Cutmix_PCG(x, loc, y, device, alpha=0.75):
     """
     同时混合信号、位置编码和标签
@@ -158,6 +157,40 @@ def Cutmix_PCG(x, loc, y, device, alpha=0.75):
     loc_mixed = loc * actual_lam + loc[rand_index] * (1. - actual_lam)
 
     return x, loc_mixed, y_mixed
+
+def Cutmix_Multimodal(ecg, pcg, loc, y, device, alpha=0.75):
+    """
+    同步处理 ECG 和 PCG 多模态数据的 Cutmix。
+    同时对 ECG 和 PCG 信号应用相同的随机置换，并按照对应比例混合信号、位置编码和标签。
+    
+    ecg: [Batch, Channel_ECG, Length_ECG]
+    pcg: [Batch, Channel_PCG, Length_PCG]
+    loc:[Batch, Loc_Dim] (PCG的位置特征)
+    y:   [Batch, Num_Classes]
+    """
+    if alpha <= 0:
+        return ecg, pcg, loc, y
+
+    lam = np.random.beta(alpha, alpha)
+    rand_index = torch.randperm(ecg.size()[0]).to(device)
+    target_a = y
+    target_b = y[rand_index]
+
+    L_ecg = ecg.size()[2]
+    bbx1_ecg, bbx2_ecg = rand_interval(L_ecg, lam)
+    ecg[:, :, bbx1_ecg:bbx2_ecg] = ecg[rand_index, :, bbx1_ecg:bbx2_ecg]
+    actual_lam_ecg = 1. - ((bbx2_ecg - bbx1_ecg) / L_ecg)
+
+    L_pcg = pcg.size()[2]
+    bbx1_pcg, bbx2_pcg = rand_interval(L_pcg, lam)
+    pcg[:, :, bbx1_pcg:bbx2_pcg] = pcg[rand_index, :, bbx1_pcg:bbx2_pcg]
+    actual_lam_pcg = 1. - ((bbx2_pcg - bbx1_pcg) / L_pcg)
+    
+    actual_lam = (actual_lam_ecg + actual_lam_pcg) / 2.0
+    y_mixed = target_a * actual_lam + target_b * (1. - actual_lam)
+    loc_mixed = loc * actual_lam + loc[rand_index] * (1. - actual_lam)
+
+    return ecg, pcg, loc_mixed, y_mixed
 
 def mask_ecg_signal(signal, valid_lead_num):
     if valid_lead_num == 1:
@@ -729,50 +762,63 @@ class LSTransPCG(nn.Module):
             out = layer(out)
         return out
 
-class TemporalAttentionAlignmentLayer(nn.Module):
-    def __init__(self, ecg_dim, pcg_dim, align_dim=128):
-        super(TemporalAttentionAlignmentLayer, self).__init__() # 1. 维度对齐：使用 1x1 卷积将通道数统一到 align_dim，方便后续做 Attention
+class HybridAlignmentLayer(nn.Module):
+    def __init__(self, ecg_dim, pcg_dim, align_dim=128, expert_dim=0):
+        super(HybridAlignmentLayer, self).__init__() 
+        # 维度对齐
         self.ecg_proj = nn.Conv1d(ecg_dim, align_dim, kernel_size=1)
         self.pcg_proj = nn.Conv1d(pcg_dim, align_dim, kernel_size=1)
         
-        # 2. 时序交叉注意力层 (Temporal Cross-Attention)
+        # 交叉注意力层
         self.cross_attn = nn.MultiheadAttention(embed_dim=align_dim, num_heads=4, batch_first=True)
         self.norm = nn.LayerNorm(align_dim)
         
-        # 3. 延迟全局池化层 (在这里把时序压平)
+        # 专家特征融合层
+        self.expert_dim = expert_dim
+        if expert_dim > 0:
+            self.fusion_mlp = nn.Sequential(
+                nn.Linear(align_dim + expert_dim, align_dim),
+                nn.LeakyReLU(0.1)
+            )
+        
         self.pool = nn.AdaptiveMaxPool1d(output_size=1)
         
-    def forward(self, ecg_feat, pcg_feat):
-        # 输入形状: [Batch, Channel, Seq_len]
+    def forward(self, ecg_feat, pcg_feat, prior_mask=None, expert_feat=None):
+        """
+        ecg_feat: [Batch, Channel, Seq_len_ECG]
+        pcg_feat: [Batch, Channel, Seq_len_PCG]
+        prior_mask: [Batch, Seq_len_ECG, Seq_len_PCG] (锚点引导)
+        expert_feat: [Batch, expert_dim] (双流融合)
+        """
+        ecg_mapped = self.ecg_proj(ecg_feat) 
+        pcg_mapped = self.pcg_proj(pcg_feat)
         
-        # --- 映射到统一维度 ---
-        ecg_mapped = self.ecg_proj(ecg_feat) # [Batch, align_dim, Seq_len_ECG]
-        pcg_mapped = self.pcg_proj(pcg_feat) #[Batch, align_dim, Seq_len_PCG]
-        
-        # --- 维度重排，满足 MultiheadAttention (要求[Batch, Seq_len, Embed_dim]) ---
         ecg_q = ecg_mapped.permute(0, 2, 1)
         pcg_kv = pcg_mapped.permute(0, 2, 1)
         
-        # --- 交叉时序注意力 (用ECG找PCG对应的位置) ---
-        attn_out, _ = self.cross_attn(query=ecg_q, key=pcg_kv, value=pcg_kv)
+        attn_out, attn_weights = self.cross_attn(
+            query=ecg_q, 
+            key=pcg_kv, 
+            value=pcg_kv, 
+            attn_mask=prior_mask
+        )
         
-        # 残差融合加归一化
-        ecg_aligned = self.norm(ecg_q + attn_out) #[Batch, Seq_len_ECG, align_dim]
+        ecg_aligned = self.norm(ecg_q + attn_out)
+        ecg_pooled = self.pool(ecg_aligned.permute(0, 2, 1)).squeeze(2) # [B, align_dim]
+        pcg_pooled = self.pool(pcg_mapped).squeeze(2)                   # [B, align_dim]
         
-        # --- 延迟池化：恢复 [Batch, Channel, Seq_len] 并压缩时序 ---
-        ecg_pooled = self.pool(ecg_aligned.permute(0, 2, 1)).squeeze(2) # [Batch, align_dim]
-        pcg_pooled = self.pool(pcg_mapped).squeeze(2)                   # [Batch, align_dim]
-        
-        # 返回的是两个融合过的一维特征，供分类器或对比损失使用
-        return ecg_pooled, pcg_pooled
-    
+        if self.expert_dim > 0 and expert_feat is not None:
+            ecg_pooled = self.fusion_mlp(torch.cat([ecg_pooled, expert_feat], dim=1))
+
+        return ecg_pooled, pcg_pooled, attn_weights
+# learnable alignment layer
 class MultimodalLSTransNet(nn.Module):
     def __init__(self, nOUT, ecg_complexity, pcg_complexity,
                  ecg_inchannels, pcg_inchannels, input_length,
                  num_layers,num_encoder_layers=1,
                  rank_list=32,information='fisher',
                  use_static_conv=False,
-                 dropout_coef=0.2,loc_dim=5):
+                 dropout_coef=0.2,loc_dim=5,expert_dim=3):
         super(MultimodalLSTransNet, self).__init__()
 
         if isinstance(rank_list, int):
@@ -801,7 +847,7 @@ class MultimodalLSTransNet(nn.Module):
         # 对齐层 和 联合分类器
         ecg_dim = ecg_complexity
         pcg_dim = pcg_complexity + 16
-        self.alignment = TemporalAttentionAlignmentLayer(ecg_dim, pcg_dim, align_dim=128)
+        self.alignment = HybridAlignmentLayer(ecg_dim, pcg_dim, align_dim=128, expert_dim=expert_dim)
 
         fusion_dim = 256
         self.classifier = nn.Sequential(
@@ -841,7 +887,7 @@ class MultimodalLSTransNet(nn.Module):
         pcg_feat = self.pcg_encoder.feature_extraction(pcg_x, pcg_loc)  # [Batch, pcg_complexity]
         
         # 送入对齐层进行对齐
-        ecg_feat_aligned, pcg_feat_aligned = self.alignment(ecg_feat, pcg_feat)
+        ecg_feat_aligned, pcg_feat_aligned, attn_weights = self.alignment(ecg_feat, pcg_feat)
         
         # 融合与分类
         fused_feat = torch.cat([ecg_feat_aligned, pcg_feat_aligned], dim=1)
@@ -854,7 +900,7 @@ class Hetero_MultimodalTeacherNet(nn.Module):
                  ecg_inchannels, pcg_inchannels, input_length,
                  num_layers=35, rank_list=32, information='fisher', 
                  num_encoder_layers=3, dropout_coef=0.2, 
-                 loc_dim=5):
+                 loc_dim=5, expert_dim=3):
         super(Hetero_MultimodalTeacherNet,self).__init__()
 
         if isinstance(rank_list, int):
@@ -878,7 +924,7 @@ class Hetero_MultimodalTeacherNet(nn.Module):
         # 对齐层 和 联合分类器
         ecg_dim = ecg_complexity
         pcg_dim = pcg_complexity + 16
-        self.alignment = TemporalAttentionAlignmentLayer(ecg_dim, pcg_dim, align_dim=128)
+        self.alignment = HybridAlignmentLayer(ecg_dim, pcg_dim, align_dim=128, expert_dim=expert_dim)
 
         fusion_dim = 256
         self.classifier = nn.Sequential(
@@ -923,7 +969,7 @@ class Hetero_MultimodalTeacherNet(nn.Module):
         pcg_feat = self.pcg_encoder.feature_extraction(pcg_x, pcg_loc)  # [Batch, pcg_complexity]
         
         # 送入对齐层进行对齐
-        ecg_feat_aligned, pcg_feat_aligned = self.alignment(ecg_feat, pcg_feat)
+        ecg_feat_aligned, pcg_feat_aligned, attn_weights = self.alignment(ecg_feat, pcg_feat)
         
         # 融合与分类
         fused_feat = torch.cat([ecg_feat_aligned, pcg_feat_aligned], dim=1)
@@ -931,4 +977,4 @@ class Hetero_MultimodalTeacherNet(nn.Module):
         
         # 如果需要特征蒸馏，可以将中间对齐后的特征一并返回
         return out, ecg_feat_aligned, pcg_feat_aligned, fused_feat
-
+# 

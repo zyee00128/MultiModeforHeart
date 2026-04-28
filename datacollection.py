@@ -13,10 +13,9 @@ from torch.utils.data import Dataset, random_split, Subset
 from sklearn.model_selection import KFold, train_test_split
 import random
 import h5py
-from tqdm import tqdm
-from PIL import Image
-from torchvision import transforms
 import librosa
+from tqdm import tqdm
+from mmdatasets_utils import MultimodalProcessor
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -350,7 +349,6 @@ class CirCorPCGDataset(Dataset):
 
         # 返回信号、标签和位置编码
         return (waveform_t, loc_t), label_t
-
 def PCGCirCorDigiScopedataset_loading(args):
     """
     加载并划分 CirCor DigiScope 数据集
@@ -432,333 +430,176 @@ def PCGCirCorDigiScopedataset_loading(args):
 
     print(f"数据集划分完成：训练集 {len(dataset_train)}，验证集 {len(dataset_valid)}，测试集 {len(dataset_test)}")
     return dataset_train, dataset_valid, dataset_test
-
-# prepare dataset for LSNet
-class ECGImageDataset(torch.utils.data.Dataset):
-    def __init__(self, img_dir, hdf5_path, transform=None, preload_devices=None, return_device=None):
-        """
-        Args:
-            img_dir: 生成的图片存放的总目录
-            hdf5_path: 对应的 HDF5 文件路径
-            transform: 图像预处理变换
-            preload_devices: 预加载的目标设备列表 ['cuda:0', 'cuda:1']
-            return_device: 训练时返回数据的设备
-        """
-        self.img_dir = img_dir
-        self.transform = transform
+# prepare dataset for multimodal model pretraining
+class MultimodalDataset(Dataset):
+    def __init__(self, hdf5_path, ecg_max_length=4096, pcg_max_length=40000, is_train=True, preload_devices=None, return_device=None):
+        self.ecg_max_length = ecg_max_length
+        self.pcg_max_length = pcg_max_length
+        self.is_train = is_train
         
-        with h5py.File(hdf5_path, 'r') as hf:
-            all_labels = np.array(hf.get('label_set')).astype(np.float32)
-            all_ids = [x.decode('utf-8') for x in hf.get('record_ids')] 
-        # id_to_idx = {rec_id: i for i, rec_id in enumerate(all_ids)}
-        id_to_idx = {(id.decode('utf-8') if isinstance(id, bytes) else str(id)): i 
-        for i, id in enumerate(all_ids)}
-
-        self.valid_img_paths = []
-        self.target_labels = []
+        # 从预处理的 HDF5 文件中同时加载多模态数据
+        hf = h5py.File(hdf5_path, 'r')
+        self.ecg_records = np.array(hf.get('ecg_set'))
+        self.pcg_records = np.array(hf.get('pcg_set'))
+        self.locations = np.array(hf.get('loc_set'))
+        self.labels = np.array(hf.get('label_set'))
+        hf.close()
         
-
-        print(f"正在匹配图片与 HDF5 标签 (Dataset: {os.path.basename(hdf5_path)})...")
-        for root, _, files in os.walk(img_dir):
-            for f in files:
-                if f.endswith('.png'):
-                    # 1. 获取完整文件名，如 '04188_lr-0'
-                    full_img_id = os.path.splitext(f)[0].strip()
-                    
-                    # 2. 去掉后缀，如 '04188_lr-0' -> '04188'
-                    base_id = full_img_id.split('_')[0]
-                    
-                    # 3. 尝试多种可能的 ID 格式去 HDF5 里碰运气
-                    match_id = None
-                    
-                    # 格式A: 去除前导零的纯数字 (针对 PTB-XL: '04188' -> '4188')
-                    if base_id.isdigit() and str(int(base_id)) in id_to_idx:
-                        match_id = str(int(base_id))
-                    
-                    # 格式B: 保持原样 (针对 Georgia/Chapman: 'E00001' 或 '04188')
-                    elif base_id in id_to_idx:
-                        match_id = base_id
-                        
-                    # 格式C: 连带后缀的完整名 (某些特定数据集可能需要)
-                    elif full_img_id in id_to_idx:
-                        match_id = full_img_id
-
-                    # 4. 如果找到了匹配的 ID，就加入训练列表
-                    if match_id is not None:
-                        self.valid_img_paths.append(os.path.join(root, f))
-                        self.target_labels.append(all_labels[id_to_idx[match_id]])
-
-
         self.preload_devices = [preload_devices] if isinstance(preload_devices, str) else preload_devices
         self.return_device = return_device if return_device else (self.preload_devices[0] if self.preload_devices else 'cpu')
+        
         self.is_preloaded = False
         if self.preload_devices is not None:
-            print(f"正在将 {len(self.valid_img_paths)} 张 ECG 轨迹图预加载至 {self.preload_devices}...")
-            self.preloaded_imgs = []
-            self.preloaded_labels = []
-            safe_margin = 1.5 * 1024 * 1024 * 1024
+            print(f"正在将多模态数据集预加载至 {self.preload_devices}...")
+            self.preloaded_ecg =[]
+            self.preloaded_pcg = []
+            self.preloaded_loc = []
+            self.preloaded_labels =[]
+
+            safe_margin = 1 * 1024 * 1024 * 1024  # 1GB 显存安全阈值
             device_idx = 0
             current_device = self.preload_devices[device_idx]
-            for i in tqdm(range(len(self.valid_img_paths)), desc="Image Preloading"):
-                if i % 50 == 0 and current_device.startswith('cuda'):
+
+            for i in tqdm(range(len(self.labels)), desc="Preloading Multimodal Data"):
+                if i % 100 == 0 and current_device.startswith('cuda'):
                     free_mem, _ = torch.cuda.mem_get_info(current_device)
                     if free_mem < safe_margin and device_idx < len(self.preload_devices) - 1:
                         device_idx += 1
                         current_device = self.preload_devices[device_idx]
-                        tqdm.write(f"\n[Info] {self.preload_devices[device_idx-1]} 显存不足，切换至: {current_device}")
-                
-                img_path = self.valid_img_paths[i]
-                img_tensor = self._load_and_transform(img_path)
-                label_tensor = torch.tensor(self.target_labels[i], dtype=torch.float32)
+                        tqdm.write(f"\n[Info] {self.preload_devices[device_idx-1]} 显存达到预警，切换至: {current_device}")
+
+                ecg_processed = self._process_ecg(self.ecg_records[i])
+                pcg_processed = self._process_pcg(self.pcg_records[i])
                 
                 try:
-                    self.preloaded_imgs.append(img_tensor.to(current_device))
-                    self.preloaded_labels.append(label_tensor.to(current_device))
+                    ecg_t = torch.tensor(ecg_processed, dtype=torch.float32, device=current_device)
+                    pcg_t = torch.tensor(pcg_processed, dtype=torch.float32, device=current_device)
+                    loc_t = torch.tensor(self.locations[i], dtype=torch.float32, device=current_device)
+                    label_t = torch.tensor(self.labels[i], dtype=torch.float32, device=current_device)
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower() and device_idx < len(self.preload_devices) - 1:
                         device_idx += 1
                         current_device = self.preload_devices[device_idx]
-                        tqdm.write(f"\n[Warning] 捕捉到 OOM，切换至: {current_device}")
-                        self.preloaded_imgs.append(img_tensor.to(current_device))
-                        self.preloaded_labels.append(label_tensor.to(current_device))
+                        tqdm.write(f"\n[Warning] 捕捉到 OOM，强制切换至: {current_device}")
+                        ecg_t = torch.tensor(ecg_processed, dtype=torch.float32, device=current_device)
+                        pcg_t = torch.tensor(pcg_processed, dtype=torch.float32, device=current_device)
+                        loc_t = torch.tensor(self.locations[i], dtype=torch.float32, device=current_device)
+                        label_t = torch.tensor(self.labels[i], dtype=torch.float32, device=current_device)
                     else:
                         raise e
-            
-            self.is_preloaded = True
-            print(f"成功预加载 {len(self.preloaded_imgs)} 张图片。")
-
-    def _load_and_transform(self, img_path):
-        """辅助函数：读取图片并转为 Tensor"""
-        try:
-            image = Image.open(img_path).convert('RGB')
-        except Exception as e:
-            print(f"\n[严重警告] 发现损坏的图片文件: {img_path}")
-            print(f"报错信息: {e}")
-            raise e # 打印出路径后再抛出异常，方便你定位去删除它
-        
-        if self.transform:
-            image = self.transform(image)
-        return image
-
-    def __len__(self):
-        return len(self.valid_img_paths)
-
-    def __getitem__(self, idx):
-        if self.is_preloaded:
-            return (self.preloaded_imgs[idx].to(self.return_device), 
-                    self.preloaded_labels[idx].to(self.return_device))
-
-        img_path = self.valid_img_paths[idx]
-        image = self._load_and_transform(img_path)
-        label = torch.tensor(self.target_labels[idx], dtype=torch.float32)
-        return image, label
-def ECGimagedataset_loading(args):
-    """
-    完善后的 2D 轨迹图加载函数
-    """
-    img_dir = os.path.join(args.root, 'Preprocessed_dataset/ECG_Imgs', args.ft_dataset)
-    label_hdf5_path = os.path.join(args.root, 'Preprocessed_dataset', 
-                                   f'class{args.num_class}_dataset_{args.ft_dataset}_32.hdf5')
-    if not os.path.exists(img_dir):
-        raise FileNotFoundError(f"找不到图片目录: {img_dir}，请先生成轨迹图。")
-    
-    # 标准 LSNet/ImageNet 预处理
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                             std=[0.229, 0.224, 0.225])
-    ])
-
-    full_dataset = ECGImageDataset(
-        img_dir=img_dir, 
-        hdf5_path=label_hdf5_path, 
-        transform=transform,
-        preload_devices=getattr(args, 'preload_devices', None),
-        return_device=args.device
-    )
-
-    total_len = len(full_dataset)
-    test_size = int(total_len * (1 - args.ft_data_ratio))
-    train_val_size = total_len - test_size
-    valid_size = int(train_val_size * 0.2)
-    train_size = train_val_size - valid_size
-
-    generator = torch.Generator().manual_seed(args.seed)
-    dataset_train, dataset_valid, dataset_test = random_split(
-        full_dataset, [train_size, valid_size, test_size], generator=generator
-    )
-    
-    return dataset_train, dataset_valid, dataset_test
-# prepare dataset for mm
-class ECGMultimodalDataset(torch.utils.data.Dataset):
-    def __init__(self, img_dir, hdf5_path, transform=None, max_length=4096, preload_devices=None, return_device=None):
-        """
-        多模态数据集加载器：同时读取 2D 图像和 1D 信号，并通过 ID 绝对对齐。
-        """
-        self.img_dir = img_dir
-        self.transform = transform
-        self.max_length = max_length
-        
-        # 1. 打开 HDF5 文件，加载 1D 信号、标签和 ID
-        with h5py.File(hdf5_path, 'r') as hf:
-            all_records_1d = np.array(hf.get('record_set'))
-            all_labels = np.array(hf.get('label_set')).astype(np.float32)
-            all_ids = [x.decode('utf-8') for x in hf.get('record_ids')] 
-            
-        id_to_idx = {(id.decode('utf-8') if isinstance(id, bytes) else str(id)): i 
-                     for i, id in enumerate(all_ids)}
-
-        self.valid_img_paths = []
-        self.target_1d_records = []
-        self.target_labels = []
-
-        print(f"正在严格对齐多模态数据 (Images + 1D HDF5)...")
-        for root, _, files in os.walk(img_dir):
-            for f in files:
-                if f.endswith('.png'):
-                    full_img_id = os.path.splitext(f)[0].strip()
-                    base_id = full_img_id.split('_')[0]
-                    
-                    match_id = None
-                    if base_id.isdigit() and str(int(base_id)) in id_to_idx:
-                        match_id = str(int(base_id))
-                    elif base_id in id_to_idx:
-                        match_id = base_id
-                    elif full_img_id in id_to_idx:
-                        match_id = full_img_id
-
-                    if match_id is not None:
-                        idx = id_to_idx[match_id]
-                        self.valid_img_paths.append(os.path.join(root, f))
-                        # 直接截断或补齐 1D 信号并存入列表
-                        self.target_1d_records.append(self._pad_or_crop(all_records_1d[idx]))
-                        self.target_labels.append(all_labels[idx])
-
-        print(f"匹配完成！共成功对齐 {len(self.valid_img_paths)} 个多模态样本。")
-
-        self.preload_devices = [preload_devices] if isinstance(preload_devices, str) else preload_devices
-        self.return_device = return_device if return_device else (self.preload_devices[0] if self.preload_devices else 'cpu')
-        self.is_preloaded = False
-        
-        # 2. 预加载逻辑 (同时加载 1D 和 2D 进显存)
-        if self.preload_devices is not None:
-            print(f"正在将 {len(self.valid_img_paths)} 个多模态样本预加载至 {self.preload_devices}...")
-            self.preloaded_1d = []
-            self.preloaded_2d = []
-            self.preloaded_labels = []
-            
-            safe_margin = 1.5 * 1024 * 1024 * 1024
-            device_idx = 0
-            current_device = self.preload_devices[device_idx]
-            
-            for i in tqdm(range(len(self.valid_img_paths)), desc="Multimodal Preloading"):
-                if i % 50 == 0 and current_device.startswith('cuda'):
-                    free_mem, _ = torch.cuda.mem_get_info(current_device)
-                    if free_mem < safe_margin and device_idx < len(self.preload_devices) - 1:
-                        device_idx += 1
-                        current_device = self.preload_devices[device_idx]
-                        tqdm.write(f"\n[Info] {self.preload_devices[device_idx-1]} 显存不足，切换至: {current_device}")
                 
-                img_path = self.valid_img_paths[i]
-                img_tensor = self._load_and_transform(img_path)
-                trace_tensor = torch.tensor(self.target_1d_records[i], dtype=torch.float32)
-                label_tensor = torch.tensor(self.target_labels[i], dtype=torch.float32)
+                self.preloaded_ecg.append(ecg_t)
+                self.preloaded_pcg.append(pcg_t)
+                self.preloaded_loc.append(loc_t)
+                self.preloaded_labels.append(label_t)
                 
-                try:
-                    self.preloaded_1d.append(trace_tensor.to(current_device))
-                    self.preloaded_2d.append(img_tensor.to(current_device))
-                    self.preloaded_labels.append(label_tensor.to(current_device))
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower() and device_idx < len(self.preload_devices) - 1:
-                        device_idx += 1
-                        current_device = self.preload_devices[device_idx]
-                        tqdm.write(f"\n[Warning] 捕捉到 OOM，切换至: {current_device}")
-                        self.preloaded_1d.append(trace_tensor.to(current_device))
-                        self.preloaded_2d.append(img_tensor.to(current_device))
-                        self.preloaded_labels.append(label_tensor.to(current_device))
-                    else:
-                        raise e
-            
             self.is_preloaded = True
-            print(f"成功分布式预加载多模态数据。")
 
-    def _pad_or_crop(self, trace):
-        """处理 1D HDF5 信号的 Padding/截断"""
+    def _process_ecg(self, trace):
         if trace.ndim == 3:
             trace = np.squeeze(trace)
-        current_len = trace.shape[1]
-        if current_len < self.max_length:
-            padding = np.zeros((trace.shape[0], self.max_length - current_len), dtype=np.float32)
-            trace = np.concatenate((trace, padding), axis=1)
-        elif current_len > self.max_length:
-            trace = trace[:, :self.max_length]
-        return trace
-
-    def _load_and_transform(self, img_path):
-        """读取图片并转为 Tensor"""
-        try:
-            image = Image.open(img_path).convert('RGB')
-        except Exception as e:
-            print(f"\n[严重警告] 发现损坏的图片文件: {img_path}")
-            raise e
+        current_len = trace.shape[-1]
         
-        if self.transform:
-            image = self.transform(image)
-        return image
+        # Padding & Cropping
+        if current_len < self.ecg_max_length:
+            padding = np.zeros((trace.shape[0], self.ecg_max_length - current_len), dtype=np.float32)
+            trace = np.concatenate((trace, padding), axis=-1)
+        elif current_len > self.ecg_max_length:
+            trace = trace[:, :self.ecg_max_length]
+        return trace
+    def _process_pcg(self, waveform):
+        if waveform.ndim > 1:
+            waveform = np.squeeze(waveform)
+            
+        # Padding & Cropping
+        current_len = len(waveform)
+        if current_len > self.pcg_max_length:
+            if self.is_train:
+                # 随机裁剪
+                start = np.random.randint(0, current_len - self.pcg_max_length)
+                waveform = waveform[start : start + self.pcg_max_length]
+            else:
+                # 居中裁剪
+                start = (current_len - self.pcg_max_length) // 2
+                waveform = waveform[start : start + self.pcg_max_length]
+        elif current_len < self.pcg_max_length:
+            pad_width = self.pcg_max_length - current_len
+            waveform = np.pad(waveform, (0, pad_width), mode='constant')
+        
+        if waveform.ndim == 1:
+            waveform = np.expand_dims(waveform, axis=0)
+        return waveform
 
     def __len__(self):
-        return len(self.valid_img_paths)
+        return len(self.labels)
 
     def __getitem__(self, idx):
-        # 如果已经预加载到显存，直接返回 3 个 Tensor
         if self.is_preloaded:
-            return (self.preloaded_1d[idx].to(self.return_device), 
-                    self.preloaded_2d[idx].to(self.return_device),
+            return (self.preloaded_ecg[idx].to(self.return_device),
+                    self.preloaded_pcg[idx].to(self.return_device),
+                    self.preloaded_loc[idx].to(self.return_device),
                     self.preloaded_labels[idx].to(self.return_device))
 
-        # 否则实时读取
-        trace = torch.tensor(self.target_1d_records[idx], dtype=torch.float32)
-        image = self._load_and_transform(self.valid_img_paths[idx])
-        label = torch.tensor(self.target_labels[idx], dtype=torch.float32)
+        ecg_trace = self._process_ecg(self.ecg_records[idx])
+        pcg_trace = self._process_pcg(self.pcg_records[idx])
         
-        return trace, image, label
-def ECG_multimodal_dataset_loading(args):
+        return (torch.tensor(ecg_trace, dtype=torch.float32),
+                torch.tensor(pcg_trace, dtype=torch.float32),
+                torch.tensor(self.locations[idx], dtype=torch.float32),
+                torch.tensor(self.labels[idx], dtype=torch.float32))
+def MultimodalDataset_loading(args, fold_idx=0):
     """
-    供 pipeline_mm 调用的数据加载和划分函数
+    提供外部调用的多模态数据加载及K-Fold划分接口
     """
-    img_dir = os.path.join(args.root, 'Preprocessed_dataset/ECG_Imgs', args.ft_dataset)
-    label_hdf5_path = os.path.join(args.root, 'Preprocessed_dataset', 
-                                   f'class{args.num_class}_dataset_{args.ft_dataset}_32.hdf5')
-    if not os.path.exists(img_dir):
-        raise FileNotFoundError(f"找不到图片目录: {img_dir}")
-    
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                             std=[0.229, 0.224, 0.225])
-    ])
+    data_path = os.path.join(args.root, 'Preprocessed_dataset', 
+                             f'class_sepe{args.num_class}_multimodal_dataset_{args.ft_dataset}.hdf5')
 
-    full_dataset = ECGMultimodalDataset(
-        img_dir=img_dir, 
-        hdf5_path=label_hdf5_path, 
-        transform=transform,
-        max_length=4096,
-        preload_devices=getattr(args, 'preload_devices', None),
+    full_dataset = MultimodalDataset(
+        hdf5_path=data_path, 
+        ecg_max_length=4096,
+        pcg_max_length=getattr(args, 'pcg_len', 40000),
+        is_train=True,
+        preload_devices=getattr(args, 'preload_devices', None), 
         return_device=args.device
     )
 
     total_len = len(full_dataset)
-    test_size = int(total_len * (1 - getattr(args, 'ft_data_ratio', 1.0)))
-    train_val_size = total_len - test_size
-    valid_size = int(train_val_size * 0.2)
-    train_size = train_val_size - valid_size
+    indices = np.arange(total_len)
+    
+    # 交叉验证划分
+    kf = KFold(n_splits=5, shuffle=True, random_state=args.seed)
+    splits = list(kf.split(indices))
+    train_val_idx, test_idx = splits[fold_idx]
+    
+    # 从训练集中划出20%作验证集
+    val_size = int(len(train_val_idx) * 0.2)
+    np.random.seed(args.seed)
+    np.random.shuffle(train_val_idx)
+    
+    train_idx = train_val_idx[val_size:]
+    valid_idx = train_val_idx[:val_size]
 
-    generator = torch.Generator().manual_seed(args.seed)
-    dataset_train, dataset_valid, dataset_test = random_split(
-        full_dataset, [train_size, valid_size, test_size], generator=generator
-    )
+    dataset_train = Subset(full_dataset, train_idx)
+    dataset_valid = Subset(full_dataset, valid_idx)
+    dataset_test = Subset(full_dataset, test_idx)
     
     return dataset_train, dataset_valid, dataset_test
+def run_multimodal_processing():
+    root = ''
+    processor = MultimodalProcessor(ecg_max_len=4096, pcg_max_len=40000)
+    
+    # 定义需要的类别列表 (从 label_mapping.csv 中筛选出的高频类)
+    final_label_list = ['164889003', '426783006', '270492004', '164891005'] # 示例 SNOMED 代码
+    
+    data_dir = os.path.join(root, '')
+    output_hdf5 = os.path.join(root, 'Preprocessed_dataset/multimodal_dataset_v1.hdf5')
+    
+    processor.organize_dataset(
+        data_dir=data_dir,
+        output_path=output_hdf5,
+        label_mapping_csv='',
+        final_label_list=final_label_list
+    )
 
+if __name__ == '__main__':
+    run_multimodal_processing()
