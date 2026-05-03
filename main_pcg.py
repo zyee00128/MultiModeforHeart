@@ -5,7 +5,7 @@ import torch
 import warnings
 import numpy as np
 from datacollection import setup_seed
-from pcg_pipeline.pipeline_pretrain_pcg import Large_model_pretraining
+from pipeline.pipeline_pretrain_pcg import Large_model_pretraining
 warnings.filterwarnings("ignore")
 
 def get_args():

@@ -5,9 +5,9 @@ import torch
 import warnings
 import numpy as np
 from datacollection import setup_seed
-from ecg_pipeline.pipeline_pretrain_ecg import Large_model_pretraining
-from ecg_pipeline.pipeline_ft import kd_student_model,cross_kd_stu
-from pcg_pipeline.pipeline_pretrain_pcg import Large_model_pretraining
+from pipeline.pipeline_pretrain_ecg import Large_model_pretraining
+from pipeline.pipeline_ft_ecg import kd_student_model,cross_kd_stu
+from pipeline.pipeline_pretrain_pcg import Large_model_pretraining
 warnings.filterwarnings("ignore")
 
 def get_args():
