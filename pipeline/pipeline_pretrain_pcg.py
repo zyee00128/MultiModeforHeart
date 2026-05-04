@@ -15,11 +15,11 @@ from tqdm import tqdm
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 
-from evaluation import print_result, find_thresholds
-from pytorchtools import EarlyStopping
+from tools.evaluation import print_result, find_thresholds
+from tools.pytorchtools import EarlyStopping
 
 from model.model_code_default import LSTransPCG, Cutmix_ECG, Cutmix_PCG
-from datacollection import PCGCirCorDigiScopedataset_loading
+from tools.datacollection import PCGCirCorDigiScopedataset_loading
 
 def cleanup():
     dist.destroy_process_group()
@@ -118,7 +118,7 @@ def Large_model_pretraining(args):
 
     optimizer = optim.AdamW(net.parameters(), lr=args.learning_rate, weight_decay=0.01)
     early_stopping = EarlyStopping(10, verbose=True, 
-                                   dataset_name=f"PCG_{model_arch}_{model_config}", 
+                                   dataset_name=f"CirCorDigiScopePCG_{model_arch}_{model_config}", 
                                    delta=0, args=args)
     
     Epoch = args.pretrain_epoch

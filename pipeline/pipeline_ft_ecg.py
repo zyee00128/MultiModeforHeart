@@ -14,9 +14,9 @@ from torch.optim.lr_scheduler import LambdaLR
 from model.model_code_default import (LSTransECG, NN_default,
                                       Cutmix_ECG, Cutmix_ECG_student, Cutmix,
                                       mask_ecg_signal)
-from pytorchtools import EarlyStopping
-from evaluation import print_result, find_thresholds
-from datacollection import ECGfinetunedataset_loading
+from tools.pytorchtools import EarlyStopping
+from tools.evaluation import print_result, find_thresholds
+from tools.datacollection import ECGfinetunedataset_loading
 
 def setup_seed(seed):
     torch.manual_seed(seed)

@@ -324,13 +324,14 @@ class MyResidualBlock(nn.Module):
         return
 
 class NN_default(nn.Module): ## backbone model definition
-    def __init__(self,nOUT,complexity,inputchannel,
+    def __init__(self,nOUT,complexity,inputchannel,input_length=1152,
                  num_layers=35,rank_list=32,information='fisher',
                  num_encoder_layers=3,dropout_coef=0.2,pos_max_len=200):
         super(NN_default,self).__init__()
         
         stride = 4
         #assert num_layers!=None
+        self.input_length = input_length
         self.num_layers = num_layers
         self.num_encoder_layers=num_encoder_layers
         self.num_classifier_layers=2
@@ -350,10 +351,12 @@ class NN_default(nn.Module): ## backbone model definition
         )
         self.classifier += nn.ModuleList([Linear(complexity,nOUT, r=0,merge_weights=False,information=information,dropout_coef=dropout_coef)])
         
+        seq_len = self.input_length // (4 ** self.num_encoder_layers)
+        seq_len = max(seq_len, 96)
         self.num_transformer_layers=self.num_layers-(3*self.num_encoder_layers+self.num_classifier_layers)
         complexity=complexity
         self.transformer_layers = nn.ModuleList(
-            [TransformerLayer(complexity, num_heads=16,seq_length=96,rank_list=self.rank_list[3*(i+self.num_encoder_layers):3*(i+1+self.num_encoder_layers)],information=information,dropout_coef=dropout_coef) for i in range(self.num_transformer_layers // 3)]
+            [TransformerLayer(complexity, num_heads=16,seq_length=seq_len,rank_list=self.rank_list[3*(i+self.num_encoder_layers):3*(i+1+self.num_encoder_layers)],information=information,dropout_coef=dropout_coef) for i in range(self.num_transformer_layers // 3)]
         )
         
         self.position_encoding = PositionalEncoding(complexity,max_len=pos_max_len)
@@ -426,17 +429,17 @@ class NN_default(nn.Module): ## backbone model definition
 
     def forward(self, x, semi_flag = False):
         x = self.feature_extraction(x, semi_flag)
-        x = self.pool(x).squeeze(2)
+        out = self.pool(x).squeeze(2)
         for layer in self.classifier:
-            x = layer(x)
-        return x
+            out = layer(out)
+        return out
 class NN_PCG(nn.Module):
     def __init__(self, nOUT, complexity, inputchannel, input_length,
                  num_layers=35, rank_list=32, information='fisher', 
                  num_encoder_layers=3, dropout_coef=0.2, 
                  loc_dim=5, pos_max_len=1000):
         super(NN_PCG, self).__init__()
-        
+
         self.num_classifier_layers = 2
         backbone_layers = num_layers - self.num_classifier_layers
         rem = (backbone_layers - 3 * num_encoder_layers - 2) % 3
@@ -452,6 +455,7 @@ class NN_PCG(nn.Module):
             nOUT=complexity, 
             complexity=complexity, 
             inputchannel=inputchannel,
+            input_length=input_length,
             num_layers=backbone_layers, # 减去分类层
             rank_list=self.rank_list[:-self.num_classifier_layers],
             information=information,
@@ -477,6 +481,7 @@ class NN_PCG(nn.Module):
                    information=information, dropout_coef=dropout_coef)
         ])
 
+        self.pool = nn.AdaptiveMaxPool1d(output_size=1)
     def compute_grad(self):
         grad_list = []
         if hasattr(self.backbone, 'compute_grad'):
@@ -509,8 +514,8 @@ class NN_PCG(nn.Module):
         combined = torch.cat([sig_feat, loc_feat], dim=1)  # [Batch, complexity + 16, Seq_len]
         return combined
     def forward(self, x, loc):
-        out = self.feature_extraction(x,loc)
-        x = self.pool(x).squeeze(2)
+        x = self.feature_extraction(x,loc)
+        out = self.pool(x).squeeze(2)
         for layer in self.classifier:
             out = layer(out)
         return out
@@ -616,10 +621,10 @@ class LSTrans_default(nn.Module):
 
     def forward(self, x):
         x = self.feature_extraction(x)
-        x = self.pool(x).squeeze(2)
+        out = self.pool(x).squeeze(2)
         for layer in self.classifier:
-            x = layer(x)
-        return x
+            out = layer(out)
+        return out
 class LSTransECG(nn.Module):
     def __init__(self,nOUT,out_channels,in_channels,input_length,
                  num_layers,num_encoder_layers=1,
@@ -679,13 +684,13 @@ class LSTransECG(nn.Module):
         self.backbone.network_rank_state_reset()
 
     def feature_extraction(self, x):
-        return self.backbone(x) 
+        return self.backbone.feature_extraction(x) 
     def forward(self, x):
         x = self.feature_extraction(x)
-        x = self.pool(x).squeeze(2)
+        out = self.pool(x).squeeze(2)
         for layer in self.classifier:
-            x = layer(x)
-        return x
+            out = layer(out)
+        return out
 class LSTransPCG(nn.Module):
     def __init__(self, nOUT, out_channels,in_channels,input_length,
                 num_layers,num_encoder_layers=1, 
@@ -724,6 +729,7 @@ class LSTransPCG(nn.Module):
                    information=information, dropout_coef=dropout_coef)
         ])
 
+        self.pool = nn.AdaptiveMaxPool1d(output_size=1)
     def compute_grad(self):
         grad_list = []
         if hasattr(self.backbone, 'compute_grad'):
@@ -749,15 +755,15 @@ class LSTransPCG(nn.Module):
         self.backbone.network_rank_state_reset()
 
     def feature_extraction(self, x, loc):
-        sig_feat = self.backbone(x) # [Batch, out_channels]
+        sig_feat = self.backbone.feature_extraction(x) # [Batch, out_channels]
         loc_feat = self.loc_branch(loc) # [Batch, 16]
         seq_len = sig_feat.size(2)
         loc_feat = loc_feat.unsqueeze(2).expand(-1, -1, seq_len)
-        combined = torch.cat([sig_feat, loc_feat], dim=2) # [Batch, out_channels + 16, Seq_len]
+        combined = torch.cat([sig_feat, loc_feat], dim=1) # [Batch, out_channels + 16, Seq_len]
         return combined
     def forward(self, x, loc):
-        out = self.feature_extraction(x, loc)
-        x = self.pool(x).squeeze(2)
+        x = self.feature_extraction(x, loc)
+        out = self.pool(x).squeeze(2)
         for layer in self.classifier:
             out = layer(out)
         return out

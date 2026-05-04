@@ -1,4 +1,4 @@
-/home/xcy/yes/envs/lsm/bin/python /home/xcy/zy/LSnet4ECG/main.py \
+/home/xcy/yes/envs/lsm/bin/python /home/xcy/zy/LSTrans/main_ecg.py \
     --tea_ranklist lora_ave \
     --model_config light \
     --device cuda:5 \
@@ -10,3 +10,11 @@
     --kd_temperature 9.0 \
     --kd_alpha 0.9 \
     --task kfold_exp
+
+/home/xcy/yes/envs/lsm/bin/python /home/xcy/zy/LSTrans/main_pcg.py \
+    --model_config large \
+    --device cuda:4 \
+    --batch_size 32 \
+    --task pretrain \
+    --patience 50 \
+    --model_arch LSTrans

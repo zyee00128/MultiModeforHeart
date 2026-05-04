@@ -4,7 +4,7 @@ import json
 import torch
 import warnings
 import numpy as np
-from datacollection import setup_seed
+from tools.datacollection import setup_seed
 from pipeline.pipeline_pretrain_ecg import Large_model_pretraining
 from pipeline.pipeline_ft_ecg import kd_student_model,cross_kd_stu
 from pipeline.pipeline_pretrain_pcg import Large_model_pretraining
@@ -17,9 +17,9 @@ def get_args():
                         help='训练模式标识，决定保存逻辑，预训练模型和学生模型只使用FT')
     parser.add_argument('--tea_ranklist', type=str, default='lora_ave', 
                         help='训练模式标识，决定保存逻辑，教师模型可选择FT or lora_ave')
-    parser.add_argument('--root', type=str, default='/home/xcy/zy/LSnet4ECG', 
+    parser.add_argument('--root', type=str, default='/home/xcy/zy/LSTrans', 
                         help='项目根目录，用于存放checkpoints等 (Project root directory)')
-    parser.add_argument('--pretrain_dataset', type=str, default='/data2/zy/LSNet4ECG/data_pretrain', 
+    parser.add_argument('--pretrain_dataset', type=str, default='/data2/zy/LSTrans/data_pretrain', 
                         help='预训练数据集文件夹路径,应包含exams.csv和hdf5文件 (Path to pretraining dataset folder, which should contain exams.csv and HDF5 files)')    
     parser.add_argument('--device', type=str, default='cuda:0', 
                         help='计算设备 (cuda or cpu)') 

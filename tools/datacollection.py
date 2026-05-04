@@ -15,7 +15,7 @@ import random
 import h5py
 import librosa
 from tqdm import tqdm
-from mmdatasets_utils import MultimodalProcessor
+from tools.mmdatasets_utils import MultimodalProcessor
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -355,6 +355,7 @@ def PCGCirCorDigiScopedataset_loading(args):
     """
     data_dir = args.pcg_data_path 
     csv_path = os.path.join(data_dir, 'training_data.csv')
+    wav_base_dir = os.path.join(data_dir, 'training_data') 
     df = pd.read_csv(csv_path)
 
     # 位置映射表 (Location One-hot)
@@ -376,7 +377,7 @@ def PCGCirCorDigiScopedataset_loading(args):
             loc = loc.strip()
             if loc not in loc_map: continue
             wav_file = f"{pid}_{loc}.wav"
-            full_path = os.path.join(data_dir, wav_file)
+            full_path = os.path.join(wav_base_dir, wav_file)
             
             if os.path.exists(full_path):
                 file_paths.append(full_path)
@@ -390,23 +391,18 @@ def PCGCirCorDigiScopedataset_loading(args):
 
     # 确保同一个人的所有录音都在同一个 set
     unique_pids = list(set(patient_ids))
-    train_pids, test_pids = train_test_split(unique_pids, test_size=0.2, random_state=args.seed)
-    train_pids, val_pids = train_test_split(train_pids, test_size=0.1, random_state=args.seed)
+    
+    # 直接划分为 80% 训练集, 20% 验证集 (不保留测试集)
+    train_pids, val_pids = train_test_split(unique_pids, test_size=0.2, random_state=args.seed)
 
     # 根据 PID 索引分配样本
     def get_indices_by_pids(target_pids, patient_ids=patient_ids):
         return [i for i, p in enumerate(patient_ids) if p in target_pids]
+    
     train_idx = get_indices_by_pids(train_pids)
     val_idx = get_indices_by_pids(val_pids)
-    test_idx = get_indices_by_pids(test_pids)
 
     # 实例化 Dataset
-    full_data = {
-        'file_paths': file_paths,
-        'labels': labels,
-        'locations': locations
-    }
-    
     dataset_train = CirCorPCGDataset(
         [file_paths[i] for i in train_idx],
         [labels[i] for i in train_idx],
@@ -421,15 +417,12 @@ def PCGCirCorDigiScopedataset_loading(args):
         target_length=args.pcg_len, is_train=False
     )
     
-    dataset_test = CirCorPCGDataset(
-        [file_paths[i] for i in test_idx],
-        [labels[i] for i in test_idx],
-        [locations[i] for i in test_idx],
-        target_length=args.pcg_len, is_train=False
-    )
+    # 删除了 dataset_test 的创建逻辑
 
-    print(f"数据集划分完成：训练集 {len(dataset_train)}，验证集 {len(dataset_valid)}，测试集 {len(dataset_test)}")
-    return dataset_train, dataset_valid, dataset_test
+    print(f"数据集划分完成：训练集 {len(dataset_train)}，验证集 {len(dataset_valid)}")
+    
+    # 只返回两个结果，与 ECGcodedataset_loading 保持一致
+    return dataset_train, dataset_valid
 # prepare dataset for multimodal model pretraining
 class MultimodalDataset(Dataset):
     def __init__(self, hdf5_path, ecg_max_length=4096, pcg_max_length=40000, is_train=True, preload_devices=None, return_device=None):

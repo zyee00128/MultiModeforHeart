@@ -4,7 +4,7 @@ import json
 import torch
 import warnings
 import numpy as np
-from datacollection import setup_seed
+from tools.datacollection import setup_seed
 from pipeline.pipeline_pretrain_pcg import Large_model_pretraining
 warnings.filterwarnings("ignore")
 
@@ -12,17 +12,17 @@ def get_args():
     parser = argparse.ArgumentParser(description="LSTransPCG Model Pretraining & Fine-tuning")
     
     ## 基础环境与路径设置 (Basic Environment & Path Settings)
-    parser.add_argument('--root', type=str, default='/home/xcy/zy/LSnet4ECG', 
+    parser.add_argument('--root', type=str, default='/home/xcy/zy/LSTrans', 
                         help='项目根目录 (Project root directory)')
-    parser.add_argument('--pcg_data_path', type=str, default='/data/CirCorDigiScope', 
-                        help='CirCor DigiScope数据集路径 (Path to CirCor dataset, contains training_data.csv)')    
+    parser.add_argument('--pcg_data_path', type=str, default='/home/xcy/zy/LSTrans/data/CirCorDigiScope', 
+                        help='CirCor DigiScope数据集路径 (Path to CirCor dataset)')    
     parser.add_argument('--device', type=str, default='cuda:0', 
                         help='计算设备 (cuda or cpu)') 
     parser.add_argument('--seed', type=int, default=42, 
                         help='随机种子 (Random seed)')
     
     ## 模型配置 (Model Configuration)
-    parser.add_argument('--model_config', type=str, default='large', choices=['large', 'light', 'student'],
+    parser.add_argument('--model_config', type=str, default='large', choices=['large', 'light', 'student', 'medium'],
                         help='模型规模配置')
     parser.add_argument('--num_class', type=int, default=2, 
                         help='分类任务类别数 (CirCor Outcome默认为2: Normal/Abnormal)')
