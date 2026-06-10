@@ -499,6 +499,13 @@ class NN_PCG(nn.Module):
         for layer in self.classifier:
             if hasattr(layer, 'r') and layer.r > 0:
                 layer.merge()
+
+    def freeze_A_grad(self):
+        self.backbone.freeze_A_grad()
+        for layer in self.classifier:
+            if hasattr(layer, 'r') and layer.r > 0:
+                layer.lora_A.requires_grad = False
+        return 
     
     def feature_extraction(self, x,loc):
         # x: [Batch, Channel, Length] -> NN_default: [Batch, Channel, 1, Length]
@@ -768,6 +775,7 @@ class LSTransPCG(nn.Module):
             out = layer(out)
         return out
 
+# learnable alignment layer
 class HybridAlignmentLayer(nn.Module):
     def __init__(self, ecg_dim, pcg_dim, align_dim=128, expert_dim=0):
         super(HybridAlignmentLayer, self).__init__() 
@@ -801,7 +809,12 @@ class HybridAlignmentLayer(nn.Module):
         
         ecg_q = ecg_mapped.permute(0, 2, 1)
         pcg_kv = pcg_mapped.permute(0, 2, 1)
-        
+
+        # 将 mask 适配到 [B * num_heads, L_q, L_k]
+        if prior_mask is not None:
+            num_heads = self.cross_attn.num_heads
+            prior_mask = prior_mask.repeat_interleave(num_heads, dim=0)
+
         attn_out, attn_weights = self.cross_attn(
             query=ecg_q, 
             key=pcg_kv, 
@@ -817,7 +830,7 @@ class HybridAlignmentLayer(nn.Module):
             ecg_pooled = self.fusion_mlp(torch.cat([ecg_pooled, expert_feat], dim=1))
 
         return ecg_pooled, pcg_pooled, attn_weights
-# learnable alignment layer
+
 class MultimodalLSTransNet(nn.Module):
     def __init__(self, nOUT, ecg_complexity, pcg_complexity,
                  ecg_inchannels, pcg_inchannels, input_length,
@@ -833,35 +846,50 @@ class MultimodalLSTransNet(nn.Module):
             self.rank_list = rank_list
 
         # 独立提取 ECG 和 PCG 特征的 Backbone
-        self.ecg_encoder = LSTransECG(nOUT, ecg_complexity, 
-                                           ecg_inchannels, 
-                                           input_length, 
-                                           num_layers, num_encoder_layers, 
-                                           rank_list, information,
-                                           use_static_conv,
-                                           dropout_coef,pos_max_len=200)
-        self.pcg_encoder = LSTransPCG(nOUT,pcg_complexity, 
-                                           pcg_inchannels, 
-                                           input_length, 
-                                           num_layers, num_encoder_layers, 
-                                           rank_list, information,
-                                           use_static_conv,
-                                           dropout_coef,loc_dim,
-                                           pos_max_len=1000)
+        self.ecg_encoder = LSTransECG(
+            nOUT=nOUT,
+            out_channels=ecg_complexity, 
+            in_channels=ecg_inchannels, 
+            input_length=input_length, 
+            num_layers=num_layers, 
+            num_encoder_layers=num_encoder_layers, 
+            rank_list=self.rank_list, 
+            information=information,
+            use_static_conv=use_static_conv,
+            dropout_coef=dropout_coef,
+            pos_max_len=200
+        )
+        self.pcg_encoder = LSTransPCG(
+            nOUT=nOUT,
+            out_channels=pcg_complexity, 
+            in_channels=pcg_inchannels, 
+            input_length=input_length, 
+            num_layers=num_layers, 
+            num_encoder_layers=num_encoder_layers, 
+            rank_list=self.rank_list, 
+            information=information,
+            use_static_conv=use_static_conv,
+            dropout_coef=dropout_coef,
+            loc_dim=loc_dim,
+            pos_max_len=1000
+        )
         
     
         # 对齐层 和 联合分类器
         ecg_dim = ecg_complexity
         pcg_dim = pcg_complexity + 16
-        self.alignment = HybridAlignmentLayer(ecg_dim, pcg_dim, align_dim=128, expert_dim=expert_dim)
+        align_dim=128
+        self.alignment = HybridAlignmentLayer(ecg_dim, pcg_dim, align_dim, expert_dim=expert_dim)
 
         fusion_dim = 256
-        self.classifier = nn.Sequential(
-            nn.Linear(fusion_dim, 128),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(0.1),
-            nn.Linear(128, nOUT)
-        )
+        self.classifier = nn.ModuleList([
+            Linear(fusion_dim, align_dim, r=self.rank_list[num_layers-2], 
+                   merge_weights=False, information=information, dropout_coef=dropout_coef)
+        ])
+        self.classifier += nn.ModuleList([
+            Linear(align_dim, nOUT, r=0, merge_weights=False, 
+                   information=information, dropout_coef=dropout_coef)
+        ])
 
     def compute_grad(self):
         grads = []
@@ -887,20 +915,27 @@ class MultimodalLSTransNet(nn.Module):
         self.ecg_encoder.network_rank_state_reset()
         self.pcg_encoder.network_rank_state_reset()
 
-    def forward(self, ecg_x, pcg_x, pcg_loc):
+    def forward(self, ecg_x, pcg_x, pcg_loc, prior_mask=None, expert_feat=None):
+        if ecg_x.dim() == 3:
+            ecg_x = ecg_x.unsqueeze(2)
+        if pcg_x.dim() == 3:
+            pcg_x = pcg_x.unsqueeze(2)
         # 独立提取特征
         ecg_feat = self.ecg_encoder.feature_extraction(ecg_x)  # [Batch, ecg_complexity]
         pcg_feat = self.pcg_encoder.feature_extraction(pcg_x, pcg_loc)  # [Batch, pcg_complexity]
         
         # 送入对齐层进行对齐
-        ecg_feat_aligned, pcg_feat_aligned, attn_weights = self.alignment(ecg_feat, pcg_feat)
+        ecg_feat_aligned, pcg_feat_aligned, attn_weights = self.alignment(
+            ecg_feat, pcg_feat, prior_mask=prior_mask, expert_feat=expert_feat
+        )
         
         # 融合与分类
         fused_feat = torch.cat([ecg_feat_aligned, pcg_feat_aligned], dim=1)
-        out = self.classifier(fused_feat)
+        out = fused_feat
+        for layer in self.classifier:
+            out = layer(out)
         
-        # 如果需要特征蒸馏，可以将中间对齐后的特征一并返回
-        return out, ecg_feat_aligned, pcg_feat_aligned, fused_feat
+        return out, ecg_feat_aligned, pcg_feat_aligned, fused_feat, attn_weights
 class Hetero_MultimodalTeacherNet(nn.Module):
     def __init__(self, nOUT, ecg_complexity, pcg_complexity,
                  ecg_inchannels, pcg_inchannels, input_length,
@@ -914,31 +949,47 @@ class Hetero_MultimodalTeacherNet(nn.Module):
         else:
             self.rank_list = rank_list
 
-        self.ecg_encoder = NN_default(nOUT,ecg_complexity,
-                                    ecg_inchannels,
-                                    num_layers,
-                                    rank_list,information,
-                                    num_encoder_layers,
-                                    dropout_coef,pos_max_len=200)
-        self.pcg_encoder = NN_PCG(nOUT, pcg_complexity, 
-                                pcg_inchannels,
-                                num_layers, 
-                                rank_list, information, 
-                                num_encoder_layers, dropout_coef, 
-                                loc_dim, pos_max_len=1000)
+        self.ecg_encoder = NN_default(
+            nOUT=nOUT,
+            complexity=ecg_complexity,
+            inputchannel=ecg_inchannels,
+            input_length=input_length,
+            num_layers=num_layers,
+            rank_list=self.rank_list,
+            information=information,
+            num_encoder_layers=num_encoder_layers,
+            dropout_coef=dropout_coef,
+            pos_max_len=200
+        )
+        self.pcg_encoder = NN_PCG(
+            nOUT=nOUT, 
+            complexity=pcg_complexity, 
+            inputchannel=pcg_inchannels,
+            input_length=input_length,
+            num_layers=num_layers, 
+            rank_list=self.rank_list, 
+            information=information, 
+            num_encoder_layers=num_encoder_layers, 
+            dropout_coef=dropout_coef, 
+            loc_dim=loc_dim, 
+            pos_max_len=1000
+        )
         
         # 对齐层 和 联合分类器
         ecg_dim = ecg_complexity
         pcg_dim = pcg_complexity + 16
-        self.alignment = HybridAlignmentLayer(ecg_dim, pcg_dim, align_dim=128, expert_dim=expert_dim)
+        align_dim=128
+        self.alignment = HybridAlignmentLayer(ecg_dim, pcg_dim, align_dim, expert_dim=expert_dim)
 
         fusion_dim = 256
-        self.classifier = nn.Sequential(
-            nn.Linear(fusion_dim, 128),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(0.1),
-            nn.Linear(128, nOUT)
-        )
+        self.classifier = nn.ModuleList([
+            Linear(fusion_dim, align_dim, r=self.rank_list[num_layers-2], 
+                   merge_weights=False, information=information, dropout_coef=dropout_coef)
+        ])
+        self.classifier += nn.ModuleList([
+            Linear(align_dim, nOUT, r=0, merge_weights=False, 
+                   information=information, dropout_coef=dropout_coef)
+        ])
 
     def compute_grad(self):
         grads = []
@@ -964,23 +1015,25 @@ class Hetero_MultimodalTeacherNet(nn.Module):
         self.ecg_encoder.network_rank_state_reset()
         self.pcg_encoder.network_rank_state_reset()
 
-    def forward(self, ecg_x, pcg_x, pcg_loc):
+    def forward(self, ecg_x, pcg_x, pcg_loc, prior_mask=None, expert_feat=None):
         if ecg_x.dim() == 3:
             ecg_x = ecg_x.unsqueeze(2)
         if pcg_x.dim() == 3:
             pcg_x = pcg_x.unsqueeze(2)
-
         # 独立提取特征
         ecg_feat = self.ecg_encoder.feature_extraction(ecg_x)  # [Batch, ecg_complexity]
         pcg_feat = self.pcg_encoder.feature_extraction(pcg_x, pcg_loc)  # [Batch, pcg_complexity]
         
         # 送入对齐层进行对齐
-        ecg_feat_aligned, pcg_feat_aligned, attn_weights = self.alignment(ecg_feat, pcg_feat)
+        ecg_feat_aligned, pcg_feat_aligned, attn_weights = self.alignment(
+            ecg_feat, pcg_feat, prior_mask=prior_mask, expert_feat=expert_feat
+        )
         
         # 融合与分类
         fused_feat = torch.cat([ecg_feat_aligned, pcg_feat_aligned], dim=1)
-        out = self.classifier(fused_feat)
+        out = fused_feat
+        for layer in self.classifier:
+            out = layer(out)
         
-        # 如果需要特征蒸馏，可以将中间对齐后的特征一并返回
-        return out, ecg_feat_aligned, pcg_feat_aligned, fused_feat
+        return out, ecg_feat_aligned, pcg_feat_aligned, fused_feat, attn_weights
 # 

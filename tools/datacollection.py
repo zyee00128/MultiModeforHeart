@@ -15,7 +15,6 @@ import random
 import h5py
 import librosa
 from tqdm import tqdm
-from tools.mmdatasets_utils import MultimodalProcessor
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -544,9 +543,12 @@ def MultimodalDataset_loading(args, fold_idx=0):
     """
     提供外部调用的多模态数据加载及K-Fold划分接口
     """
-    data_path = os.path.join(args.root, 'Preprocessed_dataset', 
-                             f'class_sepe{args.num_class}_multimodal_dataset_{args.ft_dataset}.hdf5')
-
+    dataset_name = f"multimodal_dataset_{args.ft_dataset}.hdf5"
+    data_path = os.path.join(args.root, 'Preprocessed_dataset', dataset_name)
+    
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"未找到预处理完的多模态 HDF5 数据集，路径: {data_path}")
+    
     full_dataset = MultimodalDataset(
         hdf5_path=data_path, 
         ecg_max_length=4096,
@@ -576,23 +578,33 @@ def MultimodalDataset_loading(args, fold_idx=0):
     dataset_valid = Subset(full_dataset, valid_idx)
     dataset_test = Subset(full_dataset, test_idx)
     
+    print(f"[{args.ft_dataset}] 加载完毕 | 训练集: {len(dataset_train)} | 验证集: {len(dataset_valid)} | 测试集: {len(dataset_test)}")
     return dataset_train, dataset_valid, dataset_test
-def run_multimodal_processing():
-    root = ''
-    processor = MultimodalProcessor(ecg_max_len=4096, pcg_max_len=40000)
-    
-    # 定义需要的类别列表 (从 label_mapping.csv 中筛选出的高频类)
-    final_label_list = ['164889003', '426783006', '270492004', '164891005'] # 示例 SNOMED 代码
-    
-    data_dir = os.path.join(root, '')
-    output_hdf5 = os.path.join(root, 'Preprocessed_dataset/multimodal_dataset_v1.hdf5')
-    
-    processor.organize_dataset(
-        data_dir=data_dir,
-        output_path=output_hdf5,
-        label_mapping_csv='',
-        final_label_list=final_label_list
-    )
+
+# run_preprocessing.py
+from tools.mmdatasets_utils import MultimodalProcessor
 
 if __name__ == '__main__':
-    run_multimodal_processing()
+    # 实例化数据转换核心
+    processor = MultimodalProcessor(
+        ecg_target_hz=1000, 
+        pcg_target_hz=4000, 
+        ecg_max_len=4096, 
+        pcg_max_len=40000
+    )
+
+    # 1. 预处理 Cardiology2016 
+    # 原始数据集解压路径: ./data/challenge-2016/training-a
+    processor.process_cardiology2016(
+        data_dir='./data/challenge-2016/training-a',
+        output_hdf5='./Preprocessed_dataset/multimodal_dataset_cardiology2016.hdf5'
+    )
+
+    # 2. 预处理 EPHNOGRAM
+    # 包含 .mat 原始长录音文件的路径: ./data/EPHNOGRAM/MATfiles
+    processor.process_ephnogram(
+        data_dir='./data/EPHNOGRAM/MATfiles',
+        output_hdf5='./Preprocessed_dataset/multimodal_dataset_ephnogram.hdf5',
+        segment_len_sec=10, # 每 10s 切分一段片段
+        overlap_sec=5       # 步长 5s 重叠切分
+    )
