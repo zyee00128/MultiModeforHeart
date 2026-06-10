@@ -45,7 +45,7 @@ class MultimodalProcessor:
             ecg_data = ecg_data[:self.ecg_max_len]
         return np.expand_dims(ecg_data, axis=0).astype('float32')
 
-    def _pad_or_crop_pcg(self, pcg_data, is_train=True):
+    def _pad_or_crop_pcg(self, pcg_data):
         """对齐 PCG 数据长度至 pcg_max_len"""
         if pcg_data.ndim > 1:
             pcg_data = np.squeeze(pcg_data)
@@ -58,15 +58,9 @@ class MultimodalProcessor:
         if current_len < self.pcg_max_len:
             pad_width = self.pcg_max_len - current_len
             pcg_data = np.pad(pcg_data, (0, pad_width), mode='constant')
-        else:
-            if is_train:
-                # 训练集采用随机裁剪增加泛化能力
-                start = np.random.randint(0, current_len - self.pcg_max_len)
-                pcg_data = pcg_data[start : start + self.pcg_max_len]
-            else:
-                # 验证/测试集使用中心裁剪确保一致性
-                start = (current_len - self.pcg_max_len) // 2
-                pcg_data = pcg_data[start : start + self.pcg_max_len]
+        elif current_len > self.pcg_max_len:
+            start = np.random.randint(0, current_len - self.pcg_max_len)
+            pcg_data = pcg_data[start : start + self.pcg_max_len]
                 
         return np.expand_dims(pcg_data, axis=0).astype('float32') # [1, pcg_max_len]
 
@@ -109,21 +103,58 @@ class MultimodalProcessor:
                 ecg_orig = record.p_signal[:, ecg_idx]
                 # ecg_orig = record.p_signal.T[0] # 取主通道波形
                 ecg_resampled = self._resample_signal(ecg_orig, record.fs, self.ecg_hz)
-                ecg_final = self._pad_or_crop_ecg(ecg_resampled)
+                # ecg_final = self._pad_or_crop_ecg(ecg_resampled)
                 
                 # 2. 提取心音并重采样
                 pcg_orig, pcg_fs = librosa.load(wav_file, sr=None, mono=True)
                 pcg_resampled = self._resample_signal(pcg_orig, pcg_fs, self.pcg_hz)
-                pcg_final = self._pad_or_crop_pcg(pcg_resampled)
-                
-                # 临床听诊位置占位
-                loc_onehot = np.zeros(5, dtype='float32')
-                
-                ecg_list.append(ecg_final)
-                pcg_list.append(pcg_final)
-                label_list.append(np.array([label_val], dtype='float32'))
-                loc_list.append(loc_onehot)
-                ids.append(rec_id.encode('utf-8'))
+                # pcg_final = self._pad_or_crop_pcg(pcg_resampled)
+
+                # 计算两路信号的物理时间（秒），并取较小值作为可裁切的上限
+                ecg_duration = len(ecg_resampled) / self.ecg_hz
+                pcg_duration = len(pcg_resampled) / self.pcg_hz
+                min_duration = min(ecg_duration, pcg_duration)
+                target_duration = 10.0  # 期望对齐的秒数
+                if min_duration <= target_duration:
+                    # 如果原信号不足 10s，直接进行 Padding 作为一个片段保存
+                    ecg_final = self._pad_or_crop_ecg(ecg_resampled)
+                    pcg_final = self._pad_or_crop_pcg(pcg_resampled)
+                    
+                    ecg_list.append(ecg_final)
+                    pcg_list.append(pcg_final)
+                    label_list.append(np.array([label_val], dtype='float32'))
+                    loc_list.append(np.zeros(5, dtype='float32'))
+                    ids.append(f"{rec_id}_chunk0".encode('utf-8'))
+                else:
+                    # 如果信号大于 10s，使用滑动窗口切分（例如：步长 5s 重叠切分）
+                    step_sec = 5.0
+                    ecg_chunk_pts = int(target_duration * self.ecg_hz)
+                    pcg_chunk_pts = int(target_duration * self.pcg_hz)
+                    ecg_step_pts = int(step_sec * self.ecg_hz)
+                    pcg_step_pts = int(step_sec * self.pcg_hz)
+                    
+                    idx = 0
+                    chunk_cnt = 0
+                    while (idx * ecg_step_pts + ecg_chunk_pts) <= len(ecg_resampled):
+                        ecg_start = idx * ecg_step_pts
+                        pcg_start = idx * pcg_step_pts
+                        
+                        ecg_chunk = ecg_resampled[ecg_start : ecg_start + ecg_chunk_pts]
+                        pcg_chunk = pcg_resampled[pcg_start : pcg_start + pcg_chunk_pts]
+                        
+                        ecg_final = self._pad_or_crop_ecg(ecg_chunk)
+                        pcg_final = self._pad_or_crop_pcg(pcg_chunk)
+                        
+                        ecg_list.append(ecg_final)
+                        pcg_list.append(pcg_final)
+                        label_list.append(np.array([label_val], dtype='float32'))
+                        loc_list.append(np.zeros(5, dtype='float32'))
+                        
+                        chunk_name = f"{rec_id}_chunk{chunk_cnt}"
+                        ids.append(chunk_name.encode('utf-8'))
+                        
+                        idx += 1
+                        chunk_cnt += 1
                 
             except Exception as e:
                 print(f"处理文件 {rec_id} 失败: {e}")
@@ -146,9 +177,8 @@ class MultimodalProcessor:
         """
         print("--- 开始预处理 EPHNOGRAM ---")
         mat_files = [f for f in os.listdir(data_dir) if f.endswith('.mat')]
-        
         ecg_list, pcg_list, label_list, loc_list, ids = [], [], [], [], []
-        
+
         # 物理切片点数换算
         ecg_chunk_pts = int(segment_len_sec * self.ecg_hz)
         pcg_chunk_pts = int(segment_len_sec * self.pcg_hz)

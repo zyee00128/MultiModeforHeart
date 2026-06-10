@@ -551,7 +551,7 @@ def MultimodalDataset_loading(args, fold_idx=0):
     
     full_dataset = MultimodalDataset(
         hdf5_path=data_path, 
-        ecg_max_length=4096,
+        ecg_max_length=4000,
         pcg_max_length=getattr(args, 'pcg_len', 40000),
         is_train=True,
         preload_devices=getattr(args, 'preload_devices', None), 
@@ -562,49 +562,75 @@ def MultimodalDataset_loading(args, fold_idx=0):
     indices = np.arange(total_len)
     
     # 交叉验证划分
-    kf = KFold(n_splits=5, shuffle=True, random_state=args.seed)
-    splits = list(kf.split(indices))
+    with h5py.File(data_path, 'r') as hf:
+        record_names = [name.decode('utf-8') for name in hf['record_ids']]
+    groups = np.array([name.split('_chunk')[0] for name in record_names])
+    # kf = KFold(n_splits=5, shuffle=True, random_state=args.seed)
+    # splits = list(kf.split(indices, groups=groups))
+    # train_val_idx, test_idx = splits[fold_idx]
+    from sklearn.model_selection import GroupKFold
+    gkf = GroupKFold(n_splits=5)
+    splits = list(gkf.split(indices, groups=groups))
     train_val_idx, test_idx = splits[fold_idx]
-    
-    # 从训练集中划出20%作验证集
-    val_size = int(len(train_val_idx) * 0.2)
+    train_val_groups = groups[train_val_idx]
+    unique_groups = np.unique(train_val_groups)  # 寻找所有不重复的患者
+     # 随机打乱患者分组
     np.random.seed(args.seed)
-    np.random.shuffle(train_val_idx)
-    
-    train_idx = train_val_idx[val_size:]
-    valid_idx = train_val_idx[:val_size]
+    np.random.shuffle(unique_groups)
 
+    # 划分 20% 的患者组归入验证集，其余 80% 的患者组归入训练集
+    val_group_size = int(len(unique_groups) * 0.2)
+    val_group_set = set(unique_groups[:val_group_size])
+    
+    # 根据样本所属的患者 ID，将索引分配到训练集和验证集
+    train_idx = []
+    valid_idx = []
+    for idx in train_val_idx:
+        sample_group = groups[idx]
+        if sample_group in val_group_set:
+            valid_idx.append(idx)
+        else:
+            train_idx.append(idx)
+            
+    train_idx = np.array(train_idx)
+    valid_idx = np.array(valid_idx)
+
+    # 4. 包装为 Subset
     dataset_train = Subset(full_dataset, train_idx)
     dataset_valid = Subset(full_dataset, valid_idx)
     dataset_test = Subset(full_dataset, test_idx)
     
-    print(f"[{args.ft_dataset}] 加载完毕 | 训练集: {len(dataset_train)} | 验证集: {len(dataset_valid)} | 测试集: {len(dataset_test)}")
+    print(f"[{args.ft_dataset}] 加载完毕 | "
+          f"训练集: {len(dataset_train)} (约占 {len(train_idx)/total_len:.1%}) | "
+          f"验证集: {len(dataset_valid)} (约占 {len(valid_idx)/total_len:.1%}) | "
+          f"测试集: {len(dataset_test)} (约占 {len(test_idx)/total_len:.1%})")
+          
     return dataset_train, dataset_valid, dataset_test
 
 # run_preprocessing.py
-from tools.mmdatasets_utils import MultimodalProcessor
+from mmdatasets_utils import MultimodalProcessor
 
 if __name__ == '__main__':
     # 实例化数据转换核心
     processor = MultimodalProcessor(
-        ecg_target_hz=1000, 
+        ecg_target_hz=400, 
         pcg_target_hz=4000, 
-        ecg_max_len=4096, 
+        ecg_max_len=4000, 
         pcg_max_len=40000
     )
 
     # 1. 预处理 Cardiology2016 
     # 原始数据集解压路径: ./data/challenge-2016/training-a
     processor.process_cardiology2016(
-        data_dir='./data/challenge-2016/training-a',
-        output_hdf5='./Preprocessed_dataset/multimodal_dataset_cardiology2016.hdf5'
+        data_dir='./data/cardiology2016/classification-of-heart-sound-recordings-the-physionet-computing-in-cardiology-challenge-2016-1.0.0',
+        output_hdf5='./Preprocessed_dataset/mm_dataset_cardiology2016.hdf5'
     )
 
     # 2. 预处理 EPHNOGRAM
     # 包含 .mat 原始长录音文件的路径: ./data/EPHNOGRAM/MATfiles
     processor.process_ephnogram(
-        data_dir='./data/EPHNOGRAM/MATfiles',
-        output_hdf5='./Preprocessed_dataset/multimodal_dataset_ephnogram.hdf5',
+        data_dir='./data/ephnogram/MAT',
+        output_hdf5='./Preprocessed_dataset/mm_dataset_ephnogram.hdf5',
         segment_len_sec=10, # 每 10s 切分一段片段
         overlap_sec=5       # 步长 5s 重叠切分
     )
