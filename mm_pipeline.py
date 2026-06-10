@@ -114,6 +114,7 @@ def mark_only_lora_as_trainable(model: nn.Module) -> None:
         if 'lora_' not in n and 'bias' not in n and 'classifier' not in n:
             p.requires_grad = False
     return
+
 def get_downsample_factor(model):
     """
     动态获取时序下采样因子。
@@ -133,6 +134,115 @@ def get_downsample_factor(model):
             return 4 ** encoder.backbone.num_encoder_layers
             
     return 4  # 默认降采样倍率为 4
+def cutmix_2d_attention_map(map_A, map_B, bbx1_ecg, bbx2_ecg, bbx1_pcg, bbx2_pcg, L_ecg, L_pcg):
+    """
+    对2D交叉注意力图执行对应时序切片的 Cutmix。
+    """
+    B = map_A.shape[0]
+    device = map_A.device
+    
+    # 构建 ECG 维度和 PCG 维度的选择掩码
+    I_ecg_B = torch.zeros((B, L_ecg, 1), device=device)
+    I_ecg_B[:, bbx1_ecg:bbx2_ecg, :] = 1.0
+    I_ecg_A = 1.0 - I_ecg_B
+    
+    I_pcg_B = torch.zeros((B, 1, L_pcg), device=device)
+    I_pcg_B[:, :, bbx1_pcg:bbx2_pcg] = 1.0
+    I_pcg_A = 1.0 - I_pcg_B
+    
+    # 物理一致混合：只有两端模态均来自同一信号源时，对应的注意力关系才得以保留
+    mixed_map = (I_ecg_A * I_pcg_A) * map_A + (I_ecg_B * I_pcg_B) * map_B
+    return mixed_map
+def apply_multimodal_cutmix(ecg_data, pcg_data, pcg_loc, labels, device, 
+                             prior_mask_tea=None, prior_mask_stu=None, 
+                             target_map=None, expert_feat=None, 
+                             ds_tea=4, ds_stu=4):
+    """
+    执行统一的 1D Cutmix 空间/时序变换，使得物理信号与先验掩码同步更新。
+    """
+    B = ecg_data.shape[0]
+    L_raw = ecg_data.shape[-1]
+    alpha = 1.0
+    lam = np.random.beta(alpha, alpha)
+    rand_index = torch.randperm(B).to(device)
+    
+    # 物理分辨率 Cutmix 边界
+    cut_len = int(L_raw * (1.0 - lam))
+    cx = np.random.randint(L_raw)
+    bbx1 = np.clip(cx - cut_len // 2, 0, L_raw)
+    bbx2 = np.clip(cx + cut_len // 2, 0, L_raw)
+    lam_actual = 1.0 - float(bbx2 - bbx1) / L_raw
+    
+    # 物理信号与标签 Cutmix
+    ecg_perm = ecg_data[rand_index]
+    pcg_perm = pcg_data[rand_index]
+    pcg_loc_perm = pcg_loc[rand_index]
+
+    ecg_mixed = ecg_data.clone()
+    ecg_mixed[..., bbx1:bbx2] = ecg_perm[..., bbx1:bbx2]
+    pcg_mixed = pcg_data.clone()
+    pcg_mixed[..., bbx1:bbx2] = pcg_perm[..., bbx1:bbx2]
+
+    pcg_loc_mixed = pcg_loc.clone()
+    pcg_loc_mixed[..., bbx1:bbx2] = pcg_loc_perm[..., bbx1:bbx2]
+    
+    labels_mixed = lam_actual * labels + (1.0 - lam_actual) * labels[rand_index]
+    
+    # 教师端先验掩码 Cutmix
+    prior_mask_tea_mixed = None
+    if prior_mask_tea is not None:
+        L_ecg_tea = L_raw // ds_tea
+        L_pcg_tea = L_raw // ds_tea
+        bbx1_tea = np.clip(bbx1 // ds_tea, 0, L_ecg_tea)
+        bbx2_tea = np.clip(bbx2 // ds_tea, 0, L_ecg_tea)
+        prior_mask_tea_mixed = cutmix_2d_attention_map(
+            prior_mask_tea, prior_mask_tea[rand_index],
+            bbx1_tea, bbx2_tea, bbx1_tea, bbx2_tea,
+            L_ecg_tea, L_pcg_tea
+        )
+        
+    # 学生端先验掩码 Cutmix
+    prior_mask_stu_mixed = None
+    if prior_mask_stu is not None:
+        L_ecg_stu = L_raw // ds_stu
+        L_pcg_stu = L_raw // ds_stu
+        bbx1_stu = np.clip(bbx1 // ds_stu, 0, L_ecg_stu)
+        bbx2_stu = np.clip(bbx2 // ds_stu, 0, L_ecg_stu)
+        prior_mask_stu_mixed = cutmix_2d_attention_map(
+            prior_mask_stu, prior_mask_stu[rand_index],
+            bbx1_stu, bbx2_stu, bbx1_stu, bbx2_stu,
+            L_ecg_stu, L_pcg_stu
+        )
+        
+    # 生理一致性约束图 Cutmix（以 ds_stu 尺度）
+    target_map_mixed = None
+    if target_map is not None:
+        L_ecg_stu = L_raw // ds_stu
+        L_pcg_stu = L_raw // ds_stu
+        bbx1_stu = np.clip(bbx1 // ds_stu, 0, L_ecg_stu)
+        bbx2_stu = np.clip(bbx2 // ds_stu, 0, L_ecg_stu)
+        target_map_mixed = cutmix_2d_attention_map(
+            target_map, target_map[rand_index],
+            bbx1_stu, bbx2_stu, bbx1_stu, bbx2_stu,
+            L_ecg_stu, L_pcg_stu
+        )
+        
+    # 专家生理特征 Cutmix
+    expert_feat_mixed = None
+    if expert_feat is not None:
+        expert_feat_perm = expert_feat[rand_index]
+        if expert_feat.dim() == 2:  # 全局特征 [B, D] 采用插值混合
+            expert_feat_mixed = lam_actual * expert_feat + (1.0 - lam_actual) * expert_feat_perm
+        elif expert_feat.dim() == 3:  # 序列特征 [B, D, L_exp] 执行时序拼接混合
+            L_exp = expert_feat.shape[-1]
+            ds_exp = L_raw // L_exp
+            bbx1_exp = np.clip(bbx1 // ds_exp, 0, L_exp)
+            bbx2_exp = np.clip(bbx2 // ds_exp, 0, L_exp)
+            expert_feat_mixed = expert_feat.clone()
+            expert_feat_mixed[..., bbx1_exp:bbx2_exp] = expert_feat_perm[..., bbx1_exp:bbx2_exp]
+            
+    return (ecg_mixed, pcg_mixed, pcg_loc_mixed, labels_mixed, 
+            prior_mask_tea_mixed, prior_mask_stu_mixed, target_map_mixed, expert_feat_mixed)
 
 def validate(model, valloader, device, threshold=0.5 * np.ones(5), iftest=False, iftrain=False, args=None):
     model.eval()
@@ -357,21 +467,23 @@ def multimodal_kd_teacher_model(args, is_hetero=False):
         pcg_loc = pcg_loc.float().to(device)
         labels = labels.float().to(device)
 
-        # === 1. 级联式对齐（需在 Cutmix 之前对原始物理信号进行粗对齐） ===
+        # === 级联式对齐 ===
         if mode == 'cascaded':
             with torch.no_grad():
                 # 使用 Lead 0 检测 R 波并位移对齐
                 r_peaks_raw = PhysioDetector.detect_ecg_r_peaks(ecg_data[:, 0, :], fs=1000)
             ecg_data, pcg_data = prior_tool.get_cascaded_aligned_signals(ecg_data, pcg_data, r_peaks_raw)
-        # 混合多模态信号
-        ecg_data, pcg_data, pcg_loc, labels = Cutmix_Multimodal(ecg_data, pcg_data, pcg_loc, labels, device)
         
-        # 初始化对齐参数与物理 Loss
+        # 混合多模态信号
+        # ecg_data, pcg_data, pcg_loc, labels = Cutmix_Multimodal(ecg_data, pcg_data, pcg_loc, labels, device)
+        
+        # 初始化对齐参数
         prior_mask = None
+        target_map = None
         expert_feat = None
         physio_loss = 0.0
 
-        # === 2. 其它对齐模式（在 Cutmix 后提取当前混合信号的生理特征） ===
+        # === 其它对齐模式 ===
         if mode in ['constraint', 'anchor', 'dual_stream']:
             with torch.no_grad():
                 r_peaks = PhysioDetector.detect_ecg_r_peaks(ecg_data[:, 0, :], fs=1000)
@@ -380,17 +492,30 @@ def multimodal_kd_teacher_model(args, is_hetero=False):
             ds = get_downsample_factor(net)
             ecg_seq_len = ecg_data.shape[-1] // ds
             pcg_seq_len = pcg_data.shape[-1] // ds
+            r_peaks_downsampled = [(p / ds).int() for p in r_peaks]
 
             if mode == 'anchor':
-                # 缩放 R 波位置以匹配下采样后的时序
-                r_peaks_downsampled = [(p / ds).int() for p in r_peaks]
                 prior_mask = prior_tool.get_anchor_mask(
+                    batch_size=ecg_data.shape[0],
+                    ecg_len=ecg_seq_len, pcg_len=pcg_seq_len,
+                    r_peaks=r_peaks_downsampled
+                )
+            elif mode == 'constraint':
+                target_map = prior_tool.get_physio_constraint_map(
                     batch_size=ecg_data.shape[0],
                     ecg_len=ecg_seq_len, pcg_len=pcg_seq_len,
                     r_peaks=r_peaks_downsampled
                 )
             elif mode == 'dual_stream':
                 expert_feat = prior_tool.get_medical_expert_features(r_peaks, s1_peaks)
+
+        # === 执行同步的 Cutmix 空间/时序变换 ===
+        ecg_data, pcg_data, pcg_loc, labels, _, prior_mask, target_map, expert_feat = apply_multimodal_cutmix(
+                ecg_data, pcg_data, pcg_loc, labels, device,
+                prior_mask_tea=None, prior_mask_stu=prior_mask,
+                target_map=target_map, expert_feat=expert_feat,
+                ds_tea=ds, ds_stu=ds
+            )
 
         optimizer.zero_grad()
         outputs, ecg_feat, pcg_feat, _, attn_weights = net(
@@ -399,17 +524,11 @@ def multimodal_kd_teacher_model(args, is_hetero=False):
             expert_feat=expert_feat
         )
         
-        loss_hard = F.binary_cross_entropy_with_logits(outputs, labels)
         # === 约束驱动学习（生理一致性 Loss 约束注意力热力图） ===
         if mode == 'constraint' and attn_weights is not None:
-            r_peaks_downsampled = [(p / ds).int() for p in r_peaks]
-            target_map = prior_tool.get_physio_constraint_map(
-                batch_size=ecg_data.shape[0],
-                ecg_len=ecg_seq_len, pcg_len=pcg_seq_len,
-                r_peaks=r_peaks_downsampled
-            )
             # 使用 KL 散度约束交叉注意力分布
             physio_loss = F.kl_div((attn_weights + 1e-9).log(), target_map, reduction='batchmean')
+        loss_hard = F.binary_cross_entropy_with_logits(outputs, labels)
         loss = loss_hard + lambda_physio * physio_loss
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
@@ -516,24 +635,25 @@ def multimodal_kd_student_model(args, fold_idx, is_hetero=False):
         pcg_loc = pcg_loc.float().to(device)
         labels = labels.float().to(device)
 
-        # === 1. 级联式对齐（Cutmix 前粗对齐） ===
+        # === 级联式对齐 ===
         if mode == 'cascaded':
             with torch.no_grad():
                 r_peaks_raw = PhysioDetector.detect_ecg_r_peaks(ecg_data[:, 0, :], fs=1000)
             ecg_data, pcg_data = prior_tool.get_cascaded_aligned_signals(ecg_data, pcg_data, r_peaks_raw)
 
         # 多模态 Cutmix
-        ecg_data, pcg_data, pcg_loc, labels = Cutmix_Multimodal(ecg_data, pcg_data, pcg_loc, labels, device)
+        # ecg_data, pcg_data, pcg_loc, labels = Cutmix_Multimodal(ecg_data, pcg_data, pcg_loc, labels, device)
         
         ds_tea = get_downsample_factor(teacher_net)
         ds_stu = get_downsample_factor(net)
         prior_mask_tea = None
         prior_mask_stu = None
+        target_map = None
         expert_feat = None
         physio_loss = 0.0
-
-        # === 2. 其它对齐模式 ===
-        if mode in ['anchor', 'dual_stream']:
+        
+        # === 其它对齐模式 ===
+        if mode in ['constraint', 'anchor', 'dual_stream']:
             with torch.no_grad():
                 r_peaks = PhysioDetector.detect_ecg_r_peaks(ecg_data[:, 0, :], fs=1000)
                 s1_peaks = PhysioDetector.detect_pcg_s1_peaks(pcg_data[:, 0, :], r_peaks, fs=1000)
@@ -555,10 +675,26 @@ def multimodal_kd_student_model(args, fold_idx, is_hetero=False):
                     ecg_len=ecg_len_stu, pcg_len=pcg_len_stu,
                     r_peaks=r_peaks_stu
                 )
-
+            elif mode == 'constraint':
+                ecg_len_stu = ecg_data.shape[-1] // ds_stu
+                pcg_len_stu = pcg_data.shape[-1] // ds_stu
+                r_peaks_stu = [(p / ds_stu).int() for p in r_peaks]
+                target_map = prior_tool.get_physio_constraint_map(
+                    batch_size=ecg_data.shape[0],
+                    ecg_len=ecg_len_stu, pcg_len=pcg_len_stu,
+                    r_peaks=r_peaks_stu
+                )
             elif mode == 'dual_stream':
                 expert_feat = prior_tool.get_medical_expert_features(r_peaks, s1_peaks)
         
+        # === 执行物理与先验关联图等价的 Cutmix 变换 ===
+        ecg_data, pcg_data, pcg_loc, labels, prior_mask_tea, prior_mask_stu, target_map, expert_feat = apply_multimodal_cutmix(
+                ecg_data, pcg_data, pcg_loc, labels, device,
+                prior_mask_tea=prior_mask_tea, prior_mask_stu=prior_mask_stu,
+                target_map=target_map, expert_feat=expert_feat,
+                ds_tea=ds_tea, ds_stu=ds_stu
+            )
+
         # 无梯度产生教师指导软标签
         with torch.no_grad():
             t_out, t_ecg_f, t_pcg_f, _, _ = teacher_net(
@@ -566,6 +702,7 @@ def multimodal_kd_student_model(args, fold_idx, is_hetero=False):
                 prior_mask=prior_mask_tea, 
                 expert_feat=expert_feat
             )
+
         # if hasattr(args, 'leads_for_student'):
         #     ecg_data = mask_ecg_signal(ecg_data, pcg_data, args.leads_for_student)
 
@@ -591,12 +728,6 @@ def multimodal_kd_student_model(args, fold_idx, is_hetero=False):
             s_pcg_f_pooled, t_pcg_f_pooled = s_pcg_f, t_pcg_f
         # === 约束驱动学习（生理一致性 Loss 约束注意力热力图） ===
         if mode == 'constraint' and attn_weights is not None:
-            r_peaks_downsampled = [(p / ds_stu).int() for p in r_peaks]
-            target_map = prior_tool.get_physio_constraint_map(
-                batch_size=ecg_data.shape[0],
-                ecg_len=ecg_len_stu, pcg_len=pcg_len_stu,
-                r_peaks=r_peaks_downsampled
-            )
             # 使用 KL 散度约束交叉注意力分布
             physio_loss = F.kl_div((attn_weights + 1e-9).log(), target_map, reduction='batchmean')
 
