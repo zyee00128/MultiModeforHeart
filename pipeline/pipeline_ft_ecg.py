@@ -12,8 +12,9 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LambdaLR
 
 from model.model_code_default import (LSTransECG, NN_default,
-                                      Cutmix_ECG, Cutmix_ECG_student, Cutmix,
-                                      mask_ecg_signal)
+                            Cutmix, Cutmix_ECG, Cutmix_ECG_student,
+                            mask_ecg_signal)
+from ablation_model.model_ablation import *
 from tools.pytorchtools import EarlyStopping
 from tools.evaluation import print_result, find_thresholds
 from tools.datacollection import ECGfinetunedataset_loading
@@ -28,16 +29,8 @@ def setup_seed(seed):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 def count_parameters(model):
-    # for n,p in model.named_parameters():
-    #     if p.requires_grad:
-    #         print(n)
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
-def get_linear_schedule_with_warmup(
-    optimizer,
-    num_warmup_steps,
-    num_training_steps,
-    last_epoch=-1
-):
+def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
     """ Create a schedule with a learning rate that decreases linearly after
     linearly increasing during a warmup period.
     """
@@ -48,8 +41,7 @@ def get_linear_schedule_with_warmup(
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 def mark_only_lora_as_trainable(model: nn.Module) -> None:
     for n, p in model.named_parameters():
-        if 'lora_' not in n and 'bias' not in n and n !='classifier.1.weight':
-            # print(n)
+        if 'lora_' not in n and 'bias' not in n and 'classifier.1.weight' not in n:
             p.requires_grad = False
     return
 def get_rank_list(num_layers, conv_r=8, trans_r=32):
@@ -67,7 +59,7 @@ def get_rank_list(num_layers, conv_r=8, trans_r=32):
     
     return np.array(rank_list[:num_layers])
 ## model validation on single GPU
-def validate(model, valloader, device, threshold=0.5 * np.ones(5), iftest=False, iftrain=False, args=None):
+def validate(model, valloader, device, threshold=0.5 * np.ones(5), iftest=False, iftrain=False):
     model.eval()
     losses, probs, lbls = [], [], []
     for step, (inp_windows_t, lbl_t) in enumerate(valloader):
@@ -81,7 +73,6 @@ def validate(model, valloader, device, threshold=0.5 * np.ones(5), iftest=False,
             losses.append(loss.item())
             probs.append(prob)
             lbls.append(lbl_t.data.cpu().numpy())
-            # logit.append(out.data.cpu().numpy())
     lbls = np.concatenate(lbls)
     probs = np.concatenate(probs)
 
@@ -94,40 +85,10 @@ def validate(model, valloader, device, threshold=0.5 * np.ones(5), iftest=False,
         threshold = find_thresholds(lbls, probs)
         valid_result = print_result(np.mean(losses), lbls, probs, 'valid', threshold)
     neg_ratio = (len(probs) - np.sum(probs, axis=0)) / np.sum(probs, axis=0)
-    valid_result.update({'neg_ratio': neg_ratio})
-    valid_result.update({'threshold': threshold})
+    valid_result.update({'neg_ratio': neg_ratio, 'threshold': threshold})
     return valid_result
 def validate_student(model, valloader, device, threshold=0.5 * np.ones(5), iftest=False, iftrain=False, args=None):
-    model.eval()
-    losses, probs, lbls, logit = [], [], [], []
-    for step, (inp_windows_t, lbl_t) in enumerate(valloader):
-        inp_windows_t, lbl_t = inp_windows_t.float().to(device), lbl_t.int().to(device)
-        if inp_windows_t.dim() == 3 and "NN_default" in str(type(model)):
-            inp_windows_t = inp_windows_t.unsqueeze(2)
-        with torch.no_grad():
-            out = model(inp_windows_t)
-            loss = F.binary_cross_entropy_with_logits(out, lbl_t.float())
-            prob = out.sigmoid().data.cpu().numpy()
-            losses.append(loss.item())
-            probs.append(prob)
-            lbls.append(lbl_t.data.cpu().numpy())
-            logit.append(out.data.cpu().numpy())
-    lbls = np.concatenate(lbls)
-    probs = np.concatenate(probs)
-    logit = np.concatenate(logit)
-
-    if iftest:
-        valid_result = print_result(np.mean(losses), lbls.copy(), probs.copy(), 'test', threshold)
-    elif iftrain:
-        threshold = find_thresholds(lbls.copy(), probs.copy())
-        valid_result = print_result(np.mean(losses), lbls.copy(), probs.copy(), 'train', threshold)
-    else:
-        threshold = find_thresholds(lbls, probs)
-        valid_result = print_result(np.mean(losses), lbls, probs, 'valid', threshold)
-    neg_ratio = (len(probs) - np.sum(probs, axis=0)) / np.sum(probs, axis=0)
-    valid_result.update({'neg_ratio': neg_ratio})
-    valid_result.update({'threshold': threshold})
-    return valid_result
+    return validate(model, valloader, device, threshold, iftest, iftrain)
 
 def load_pretrained_model(net, path, args):
     pretrained_dict = torch.load(path, map_location=args.device)
@@ -139,132 +100,138 @@ def load_pretrained_model(net, path, args):
         elif f"backbone.{k}" in model_dict:
             new_pretrained_dict[f"backbone.{k}"] = v
 
-    pretrained_dict = {k: v 
-                       for k, v in new_pretrained_dict.items() 
-                       if k.find('classifier.1') < 0}
-    
+    pretrained_dict = {k: v for k, v in new_pretrained_dict.items() if k.find('classifier.1') < 0}
     model_dict.update(pretrained_dict)
     net.load_state_dict(model_dict)
     return net
-
 def loading_lora_checkpoint(net, path, args):
     pretrained_dict = torch.load(path, map_location=args.device)
     model_dict = net.state_dict()
     pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
     model_dict.update(pretrained_dict)
     net.load_state_dict(model_dict)
-    # net.load_state_dict(torch.load(path))
     return net
-def model_config_initializations(args, input_length=4096):
-    model_config = args.model_config
-    device = args.device
-    path = args.root + '/pretrained_checkpoint/'
-    
-    setup_seed(args.seed) 
-    num_leads = 12
-    num_class = args.num_class
 
-    if args.task in ['kd_finetune', 'only_finetune']:
-        file_name_pretrain = 'CODE15_Pretrain_' + model_config + '_checkpoint.pt'
-        if model_config == 'large':
+def get_teacher_model(args, input_length, num_class):
+    device = args.device
+    path = os.path.join(args.root, 'pretrained_checkpoint')
+    
+    ablation_odd = 'none'
+    ablation_even = 'none'
+
+    if args.mode == 'homo':
+        file_name_pretrain = f'CODE15_Pretrain_{args.model_config}_checkpoint.pt'
+        if args.model_config == 'large':
             num_layers, complexity = 42, 768
-        elif model_config == 'light':
-            num_layers, complexity = 30, 128
-        else:
+        else:  # 'light'
             num_layers, complexity = 30, 128
         r = get_rank_list(num_layers, args.conv_r, args.trans_r)
-
-        if args.ranklist == 'lora_ave': ## equals LoRA
-            net = LSTransECG(nOUT=num_class, out_channels=complexity, in_channels=num_leads, 
-                                input_length=input_length, 
-                                num_layers=num_layers, rank_list=r).to(device)
+        
+        if args.ranklist == 'lora':
+            net = LSTransECG(nOUT=num_class, out_channels=complexity, in_channels=12, 
+                             input_length=input_length, num_layers=num_layers, rank_list=r,
+                             ablation_odd=ablation_odd, ablation_even=ablation_even).to(device)
             mark_only_lora_as_trainable(net)
-        else: ## equals Full fine-tuning
-            net = LSTransECG(nOUT=num_class, out_channels=complexity, in_channels=num_leads, 
-                                input_length=input_length, 
-                                num_layers=num_layers, rank_list=0).to(device)
-    elif args.task == 'Cross_kd':
-        file_name_pretrain = 'CODE_testmediumbias_full_checkpoint.pkl'#CODE_testmediumbias_full_checkpoint.pkl
+        else:  # 'ft'
+            net = LSTransECG(nOUT=num_class, out_channels=complexity, in_channels=12, 
+                             input_length=input_length, num_layers=num_layers, rank_list=0,
+                             ablation_odd=ablation_odd, ablation_even=ablation_even).to(device)
+            
+    elif args.mode == 'hetero':
+        file_name_pretrain = 'CODE_testmediumbias_full_checkpoint.pkl'
         num_layers, complexity = 47, 512
         r = get_rank_list(num_layers, args.conv_r, args.trans_r)
-
-        if args.ranklist == 'lora_ave': ## equals LoRA
-            net = NN_default(nOUT=num_class, complexity=complexity, inputchannel=num_leads, 
-                                num_layers=num_layers, rank_list=r).to(device)
+        
+        if args.ranklist == 'lora':
+            net = NN_default(nOUT=num_class, complexity=complexity, inputchannel=12, 
+                             input_length=input_length,num_layers=num_layers, rank_list=r).to(device)
             mark_only_lora_as_trainable(net)
-        else: ## equals Full fine-tuning
-            net = NN_default(nOUT=num_class, complexity=complexity, inputchannel=num_leads,  
-                                num_layers=num_layers, rank_list=0).to(device)
-            
-    net = load_pretrained_model(net, path + file_name_pretrain, args)
+        else:  # 'ft'
+            net = NN_default(nOUT=num_class, complexity=complexity, inputchannel=12,  
+                             input_length=input_length,num_layers=num_layers, rank_list=0).to(device)
+    else:
+        raise ValueError(f"Teacher is not used in student-only mode: {args.mode}")
 
-    if 'lora' in args.ranklist:
-        params_to_update = []
-        for name, param in net.named_parameters():
-            if name.find('lora') > -1:
-                params_to_update.append(param)
-            elif name.find('bias') > -1:
-                params_to_update.append(param)
-            elif name.find('classifier.1.weight') > -1:
-                params_to_update.append(param)
+    net = load_pretrained_model(net, os.path.join(path, file_name_pretrain), args)
+    
+    if args.ranklist == 'lora':
+        params_to_update = [param for name, param in net.named_parameters() 
+                            if 'lora' in name or 'bias' in name or 'classifier.1.weight' in name]
         optimizer = optim.AdamW(params_to_update, lr=args.learning_rate)
     else:
         optimizer = optim.AdamW(net.parameters(), lr=args.learning_rate)
+        
+    return net, optimizer
+def get_student_model(args, input_length, num_class):
+    device = args.device
+    path = os.path.join(args.root, 'pretrained_checkpoint')
+    prestu_checkpoint = "CODE15_Pretrain_student"
+    prestu_path = os.path.join(path, prestu_checkpoint + '_checkpoint.pt')
     
+    num_layers, complexity = 9, 64
+    ablation_odd = getattr(args, 'ablation_odd', 'none')
+    ablation_even = getattr(args, 'ablation_even', 'none')
+
+    # 学生模型默认在分类微调时不使用 LoRA (rank_list=0) 且全量训练
+    net = LSTransECG(nOUT=num_class, out_channels=complexity, in_channels=12, 
+                     input_length=input_length, num_layers=num_layers, rank_list=0,
+                     ablation_odd=ablation_odd,
+                     ablation_even=ablation_even).to(device)
+    net = load_pretrained_model(net, prestu_path, args)
+    
+    optimizer = optim.AdamW(net.parameters(), lr=args.learning_rate)
     return net, optimizer
 
-## Same Config Finetuning
-def kd_teacher_model(args):
+def train_teacher(args, fold_idx=0):
     device = args.device
-    model_config = args.model_config + '_kd_ft_teacher'
-    path = args.root + '/pretrained_checkpoint/'
-    batch_size = args.batch_size
-    if batch_size > 64:
-        args.learning_rate = 0.002
-    else:
-        args.learning_rate = 0.001
     setup_seed(args.seed)
-    checkpoint_name = args.ft_dataset + '_' + args.tea_ranklist + '_' + model_config  + '_seed' + str(args.seed)
-    
-    ## dataset loading
-    dataset_train, dataset_valid, dataset_test = ECGfinetunedataset_loading(args=args)
+    path = os.path.join(args.root, 'pretrained_checkpoint')
+    batch_size = args.batch_size
+    args.learning_rate = 0.002 if batch_size > 64 else 0.001
+    fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
+    checkpoint_name = f"{args.ft_dataset}_{args.ranklist}_{args.mode}_teacher_{args.model_config}_seed{args.seed}{fold_suffix}"
+
+    dataset_train, dataset_valid, dataset_test = ECGfinetunedataset_loading(args=args, fold_idx=fold_idx)
     loader_train = DataLoader(dataset_train, batch_size=batch_size, shuffle=True, num_workers=0)
     loader_valid = DataLoader(dataset_valid, batch_size=batch_size, shuffle=True, num_workers=0)
     loader_test = DataLoader(dataset_test, batch_size=batch_size, shuffle=True, num_workers=0)
-    label_iter = iter(loader_train)
     iteration = len(loader_train) * args.ft_epoch
-    if args.ft_dataset == 'WFDB_Ga' or args.ft_dataset == 'WFDB_ChapmanShaoxing':
-        iteration = iteration * 2
+    if args.ft_dataset in ['WFDB_Ga', 'WFDB_ChapmanShaoxing']:
+        iteration *= 2
+    sample_data, _ = dataset_train[0]
+    actual_input_length = sample_data.shape[-1]
+    
+    net, optimizer = get_teacher_model(args, actual_input_length, args.num_class)
+    early_stopping = EarlyStopping(patience=args.patience, verbose=True, dataset_name=checkpoint_name, delta=0, args=args)
+    my_lr_scheduler = get_linear_schedule_with_warmup(optimizer, int(iteration * 0.01), iteration, last_epoch=-1)
 
     start_time = time.time()
-    sample_data, _ = dataset_train[0]
-    actual_input_length = sample_data.shape[-1]  
-    net, optimizer = model_config_initializations(args, input_length=actual_input_length)
-    early_stopping = EarlyStopping(patience=args.patience, verbose=True, 
-                                   dataset_name=checkpoint_name, 
-                                   delta=0, args=args)
-    my_lr_scheduler = get_linear_schedule_with_warmup(optimizer,int(iteration*0.01), iteration, last_epoch=-1)
-    # asl_loss = AsymmetricLoss(gamma_neg=4, gamma_pos=0).to(device)
-
     net.train()
     total_loss = 0.0
     best_threshold = 0.5 * np.ones(args.num_class)
-    pbar = tqdm(range(iteration), desc=f"KD Teacher Finetuning")
+    label_iter = iter(loader_train)
+    pbar = tqdm(range(iteration), desc=f"Teacher Finetuning [{args.mode}]")
+    
     for step in pbar:
         try:
             images, labels = next(label_iter)
         except StopIteration:
             label_iter = iter(loader_train)
             images, labels = next(label_iter)
-
         images = images.float().to(device, non_blocking=True)
         labels = labels.float().to(device, non_blocking=True)
-        images, labels = Cutmix_ECG(images, labels, device)
         
+        # 异同构教师的输入格式与 Cutmix 处理方式存在区别
+        if args.mode == 'hetero':
+            if images.dim() == 3:
+                images = images.unsqueeze(2)
+            images, labels = Cutmix(images, labels, device)
+        else:
+            images, labels = Cutmix_ECG(images, labels, device)
+
         optimizer.zero_grad()
         outputs = net(images)
         loss = F.binary_cross_entropy_with_logits(outputs, labels)
-        # loss = asl_loss(outputs, labels)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
         optimizer.step()
@@ -272,32 +239,30 @@ def kd_teacher_model(args):
 
         current_loss = loss.item()
         total_loss += current_loss
-        avg_loss = total_loss / (step + 1)
-        pbar.set_postfix({'loss': f'{current_loss:.4f}', 'avg_loss': f'{avg_loss:.4f}'})
+        pbar.set_postfix({'loss': f'{current_loss:.4f}', 'avg_loss': f'{(total_loss / (step + 1)):.4f}'})
 
         if (step + 1) % len(loader_train) == 0:
-            net.eval() 
-            valid_result = validate(net, loader_valid, threshold = 0.5 * np.ones(args.num_class), device=device)
+            net.eval()
+            valid_result = validate(net, loader_valid, threshold=0.5 * np.ones(args.num_class), device=device)
             early_stopping(1 / valid_result['Map_value'], net)
-            if early_stopping.counter == 0: 
+            if early_stopping.counter == 0:
                 best_threshold = valid_result['threshold']
             if early_stopping.early_stop:
-                tqdm.write("\nEarly stopping triggered") 
+                tqdm.write("\nEarly stopping triggered")
                 break
-
             net.train()
 
     pbar.close()
 
     end_time = time.time()
-    actual_steps = step + 1
-    running_time = (end_time - start_time) / actual_steps
-    allocated_memory = torch.cuda.max_memory_allocated(device)  # max_
-    net = loading_lora_checkpoint(net, path + checkpoint_name + '_checkpoint.pt', args)
+    running_time = (end_time - start_time) / (step + 1)
+    allocated_memory = torch.cuda.max_memory_allocated(device)
+    net = loading_lora_checkpoint(net, os.path.join(path, checkpoint_name + '_checkpoint.pt'), args)
     trainable_num = count_parameters(net)
-    
+
     net.eval()
-    net.merge_net()
+    if hasattr(net, 'merge_net'):
+        net.merge_net()
     test_result = validate(net, loader_test, device, iftest=True, threshold=best_threshold)
     test_result.update({
         'trainable_num': trainable_num,
@@ -307,389 +272,127 @@ def kd_teacher_model(args):
 
     tea_res_dir = os.path.join(args.root, 'results')
     os.makedirs(tea_res_dir, exist_ok=True)
-    tea_res_save_path = os.path.join(tea_res_dir, checkpoint_name + '_result.json')
-    serializable_res = {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in test_result.items()}
-    with open(tea_res_save_path, 'w') as f:
-        json.dump(serializable_res, f, indent=4)
+    with open(os.path.join(tea_res_dir, checkpoint_name + '_result.json'), 'w') as f:
+        json.dump({k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in test_result.items()}, f, indent=4)
+        
     return net
-def kd_student_model(args, fold_idx):
-    teacher_checkpoint_name = args.ft_dataset + '_' + args.ranklist + '_' + args.model_config + '_kd_ft_teacher' + '_seed' + str(args.seed)
-    teacher_checkpoint_path = os.path.join(args.root, 'pretrained_checkpoint', teacher_checkpoint_name + '_checkpoint.pt')
+def train_student(args, fold_idx=0):
+    device = args.device
+    setup_seed(args.seed)
+    path = os.path.join(args.root, 'pretrained_checkpoint')
+    batch_size = args.batch_size
+    args.learning_rate = 0.002
+    fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
+    checkpoint_name = f"{args.ft_dataset}_student_{args.mode}_{args.ranklist}_leads{args.leads_for_student}_seed{args.seed}{fold_suffix}"
+
     dataset_train, dataset_valid, dataset_test = ECGfinetunedataset_loading(args=args, fold_idx=fold_idx)
     actual_input_length = dataset_train[0][0].shape[-1]
-    if os.path.exists(teacher_checkpoint_path):
-        print(f"--- Teacher checkpoint found at {teacher_checkpoint_path}. Loading existing model. ---")
-        teacher_net, _ = model_config_initializations(args, input_length=actual_input_length)
-        teacher_net = loading_lora_checkpoint(teacher_net, teacher_checkpoint_path, args)
-        teacher_net.eval()
-        if hasattr(teacher_net, 'merge_net'):
-            teacher_net.merge_net()
-    else:
-        print("--- Teacher checkpoint not found. Starting teacher training... ---")
-        teacher_net = kd_teacher_model(args)
     
-    teacher_net.eval() # 教师模型固定，只用于推理
-    for param in teacher_net.parameters():
-        param.requires_grad = False
-    args.ranklist = 'FT'
-    device = args.device
-    path = args.root + '/pretrained_checkpoint/'
-    batch_size = args.batch_size
-    args.learning_rate = 0.002
-    T = args.kd_temperature      
-    alpha = args.kd_alpha   
-    # beta = args.kd_beta   
-    setup_seed(args.seed)
-    model_config = '_student_KD_FineTune_' + args.model_config + '_' + args.tea_ranklist
-    checkpoint_name = args.ft_dataset + model_config  + '_seed' + str(args.seed)
-    prestu_checkpoint = "CODE15_Pretrain_student"
-    prestu_path = os.path.join(path, prestu_checkpoint + '_checkpoint.pt')
-    ## dataset loading
+    # 尝试初始化/加载教师模型（KD 模式）
+    teacher_net = None
+    if args.mode in ['homo', 'hetero']:
+        fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
+        teacher_checkpoint_name = f"{args.ft_dataset}_{args.ranklist}_{args.mode}_teacher_{args.model_config}_seed{args.seed}{fold_suffix}"
+        teacher_checkpoint_path = os.path.join(path, teacher_checkpoint_name + '_checkpoint.pt')
+        
+        if os.path.exists(teacher_checkpoint_path):
+            print(f"--- Loading existing Teacher checkpoint from {teacher_checkpoint_path} ---")
+            teacher_net, _ = get_teacher_model(args, actual_input_length, args.num_class)
+            teacher_net = loading_lora_checkpoint(teacher_net, teacher_checkpoint_path, args)
+            teacher_net.eval()
+            if hasattr(teacher_net, 'merge_net'):
+                teacher_net.merge_net()
+        else:
+            print(f"--- Teacher checkpoint not found. Training teacher first... ---")
+            teacher_net = train_teacher(args, fold_idx=fold_idx)
+        teacher_net.eval()
+        for param in teacher_net.parameters():
+            param.requires_grad = False
+
+    # 建立学生模型和相关训练参数
     loader_train = DataLoader(dataset_train, batch_size=batch_size, shuffle=True, num_workers=0)
     loader_valid = DataLoader(dataset_valid, batch_size=batch_size, shuffle=True, num_workers=0)
     loader_test = DataLoader(dataset_test, batch_size=batch_size, shuffle=True, num_workers=0)
-    
-    label_iter = iter(loader_train)
     iteration = len(loader_train) * args.ft_epoch
     if args.ft_dataset in ['WFDB_Ga', 'WFDB_ChapmanShaoxing']:
-        iteration = iteration * 2
+        iteration *= 2
 
-    start_time = time.time() 
-    num_layers, complexity = 9, 64 
-    net = LSTransECG(nOUT=args.num_class, out_channels=complexity, in_channels=12, 
-                             input_length=actual_input_length, 
-                             num_layers=num_layers, rank_list=0,
-                             use_static_conv=args.static_conv).to(device)
-    net = load_pretrained_model(net, prestu_path, args)
-    # ## 中间层特征蒸馏
-    # # 中间层特征提取
-    # teacher_feats = {}
-    # student_feats = {}
-    # def get_teacher_feat(name):
-    #     def hook(model, input, output):
-    #         teacher_feats[name] = input[0].detach()
-    #     return hook
-    # def get_student_feat(name):
-    #     def hook(model, input, output):
-    #         student_feats[name] = input[0]
-    #     return hook
-    # teacher_net.classifier[0].register_forward_hook(get_teacher_feat('pre_cls'))
-    # net.classifier[0].register_forward_hook(get_student_feat('pre_cls'))
-    # # 投影层对齐特征维度
-    # if 'large' in args.model_config:
-    #     teacher_dim = 768
-    # else:
-    #     teacher_dim = 128
-    # student_dim = complexity
-    # projector = nn.Linear(student_dim, teacher_dim).to(device)
-    # net.add_module('kd_projector', projector)
-    optimizer = optim.AdamW(net.parameters(), lr=args.learning_rate)
-    
-    early_stopping = EarlyStopping(patience=args.patience, verbose=True, 
-                                   dataset_name=checkpoint_name, delta=0, args=args)
-    my_lr_scheduler = get_linear_schedule_with_warmup(optimizer, int(iteration*0.01), iteration, last_epoch=-1)
-    # asl_loss = AsymmetricLoss(gamma_neg=4, gamma_pos=0).to(device)
-
-    net.train()
-    # projector.train()
-    best_threshold = 0.5 * np.ones(args.num_class)
-    pbar = tqdm(range(iteration), desc=f"KD Student Training")
-    for step in pbar:
-        try:
-            images, labels = next(label_iter)
-        except StopIteration:
-            label_iter = iter(loader_train)
-            images, labels = next(label_iter)
-
-        images = images.float().to(device, non_blocking=True)
-        labels = labels.float().to(device, non_blocking=True)
-        images, labels = Cutmix_ECG_student(images, labels, device)
-        with torch.no_grad():
-            teacher_outputs = teacher_net(images)
-        if hasattr(args, 'leads_for_student'):
-            images = mask_ecg_signal(images, args.leads_for_student)
-        optimizer.zero_grad()
-        outputs = net(images)
-
-        # 硬标签损失
-        loss_hard = F.binary_cross_entropy_with_logits(outputs, labels)
-        # loss_hard = asl_loss(outputs, labels)
-        # 带温度系数的软标签蒸馏损失
-        student_logits_T = outputs / T
-        teacher_logits_T = teacher_outputs / T
-        loss_soft = F.binary_cross_entropy_with_logits(student_logits_T, teacher_logits_T.sigmoid()) * (T * T)
-        # #  中间层特征 MSE 投影对齐损失
-        # s_feat = student_feats['pre_cls']
-        # t_feat = teacher_feats['pre_cls']
-        # if len(s_feat.shape) == 3:
-        #     s_feat = s_feat.mean(dim=-1)
-        #     t_feat = t_feat.mean(dim=-1)
-        # s_feat_projected = projector(s_feat)
-        # s_feat = F.normalize(s_feat_projected, p=2, dim=1)
-        # t_feat = F.normalize(t_feat, p=2, dim=1)
-        # loss_feat = F.mse_loss(s_feat, t_feat)
-        loss = (1.0 - alpha) * loss_hard + alpha * loss_soft #+ beta * loss_feat
-        # loss = loss_hard + loss_soft
-        loss.backward()
-        # torch.nn.utils.clip_grad_norm_(list(net.parameters()) + list(projector.parameters()), max_norm=1.0)
-        torch.nn.utils.clip_grad_norm_(list(net.parameters()), max_norm=1.0)
-        optimizer.step()
-        my_lr_scheduler.step()
-        current_loss = loss.item()
-        # pbar.set_postfix({
-        #     'L_all': f'{current_loss:.3f}', 
-        #     'L_hard': f'{loss_hard.item():.3f}',
-        #     'L_soft': f'{loss_soft.item():.3f}',
-        #     'L_feat': f'{loss_feat.item():.4f}'
-        # })
-        pbar.set_postfix({
-            'L_all': f'{current_loss:.3f}', 
-            'L_hard': f'{loss_hard.item():.3f}',
-            'L_soft': f'{loss_soft.item():.3f}'
-        })
-        # student_feats.clear()
-        # teacher_feats.clear()
-
-        if (step + 1) % len(loader_train) == 0:
-            net.eval()
-            valid_result = validate(net, loader_valid, threshold=0.5 * np.ones(args.num_class), device=device)
-            early_stopping(1 / valid_result['Map_value'], net)
-            if early_stopping.counter == 0: 
-                best_threshold = valid_result['threshold']
-            if early_stopping.early_stop:
-                tqdm.write("\nEarly stopping triggered") 
-                break
-            net.train()
-        
-    pbar.close()
-
-    end_time = time.time()
-    actual_steps = step + 1
-    running_time = (end_time - start_time) / actual_steps
-    allocated_memory = torch.cuda.max_memory_allocated(device)  # max_
-    net.load_state_dict(torch.load(path + checkpoint_name + '_checkpoint.pt', map_location=device))
-    trainable_num = count_parameters(net)
-
-    net.eval()
-    test_result = validate_student(net, loader_test, device, iftest=True, threshold=best_threshold, args=args)
-    test_result.update({
-        'trainable_num': trainable_num,
-        'memory': allocated_memory,
-        'time': running_time
-    })
-    
-    return test_result
-
-## NN for teacher & LSNet for student
-def cross_kd_tea(args):
-    device = args.device
-    model_config = args.model_config + '_CrossKD_teacher'
-    path = args.root + '/pretrained_checkpoint/'
-    batch_size = args.batch_size
-    if batch_size > 64:
-        args.learning_rate = 0.002
-    else:
-        args.learning_rate = 0.001
-    setup_seed(args.seed)
-    checkpoint_name = args.ft_dataset + '_' + args.tea_ranklist + '_' + model_config  + '_seed' + str(args.seed)
-    ## dataset loading
-    dataset_train, dataset_valid, dataset_test = ECGfinetunedataset_loading(args=args)
-    loader_train = DataLoader(dataset_train, batch_size=batch_size, shuffle=True, num_workers=0)
-    loader_valid = DataLoader(dataset_valid, batch_size=batch_size, shuffle=True, num_workers=0)
-    loader_test = DataLoader(dataset_test, batch_size=batch_size, shuffle=True, num_workers=0)
-    label_iter = iter(loader_train)
-    iteration = len(loader_train) * args.ft_epoch
-    if args.ft_dataset == 'WFDB_Ga' or args.ft_dataset == 'WFDB_ChapmanShaoxing':
-        iteration = iteration * 2
+    net, optimizer = get_student_model(args, actual_input_length, args.num_class)
+    early_stopping = EarlyStopping(patience=args.patience, verbose=True, dataset_name=checkpoint_name, delta=0, args=args)
+    my_lr_scheduler = get_linear_schedule_with_warmup(optimizer, int(iteration * 0.01), iteration, last_epoch=-1)
 
     start_time = time.time()
-    sample_data, _ = dataset_train[0]
-    actual_input_length = sample_data.shape[-1]  
-    net, optimizer = model_config_initializations(args, input_length=actual_input_length)
-    early_stopping = EarlyStopping(patience=args.patience, verbose=True, 
-                                   dataset_name=checkpoint_name, 
-                                   delta=0, args=args)
-    my_lr_scheduler = get_linear_schedule_with_warmup(optimizer,int(iteration*0.01), iteration, last_epoch=-1)
-   
     net.train()
-    total_loss = 0.0
     best_threshold = 0.5 * np.ones(args.num_class)
-    pbar = tqdm(range(iteration), desc=f"KD Teacher Finetuning")
+    label_iter = iter(loader_train)
+    pbar = tqdm(range(iteration), desc=f"Student Training [{args.mode} / Leads: {args.leads_for_student}]")
+
     for step in pbar:
         try:
             images, labels = next(label_iter)
         except StopIteration:
             label_iter = iter(loader_train)
             images, labels = next(label_iter)
-
         images = images.float().to(device, non_blocking=True)
         labels = labels.float().to(device, non_blocking=True)
-        if images.dim() == 3:
-            images = images.unsqueeze(2)
-        with torch.no_grad():
-            images, labels = Cutmix(images, labels, device)
+        # 针对学生做裁剪
+        images, labels = Cutmix_ECG_student(images, labels, device, valid_lead_num=args.leads_for_student)
+        
+        # KD 模式：学生模型计算前由未被 mask 掉的原整组通道生成教师的 Soft 预测
+        if teacher_net is not None:
+            with torch.no_grad():
+                if args.mode == 'hetero':
+                    # 异构教师模型期望输入为 4D tensor
+                    teacher_input = images.unsqueeze(2) if images.dim() == 3 else images
+                    teacher_outputs = teacher_net(teacher_input)
+                else:
+                    teacher_outputs = teacher_net(images)
+
+        # 对学生模型应用局部导联丢失遮挡（Mask）
+        images = mask_ecg_signal(images, args.leads_for_student)
+        
         optimizer.zero_grad()
         outputs = net(images)
-        loss = F.binary_cross_entropy_with_logits(outputs, labels)
+
+        loss_hard = F.binary_cross_entropy_with_logits(outputs, labels)
+        if teacher_net is not None:
+            T = args.kd_temperature
+            alpha = args.kd_alpha
+            student_logits_T = outputs / T
+            teacher_logits_T = teacher_outputs / T
+            loss_soft = F.binary_cross_entropy_with_logits(student_logits_T, teacher_logits_T.sigmoid()) * (T * T)
+            loss = (1.0 - alpha) * loss_hard + alpha * loss_soft
+        else:
+            loss = loss_hard
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
         optimizer.step()
         my_lr_scheduler.step()
 
         current_loss = loss.item()
-        total_loss += current_loss
-        avg_loss = total_loss / (step + 1)
-        pbar.set_postfix({'loss': f'{current_loss:.4f}', 'avg_loss': f'{avg_loss:.4f}'})
-
-        if (step + 1) % len(loader_train) == 0:
-            net.eval() 
-            valid_result = validate(net, loader_valid, threshold = 0.5 * np.ones(args.num_class), device=device)
-            early_stopping(1 / valid_result['Map_value'], net)
-            if early_stopping.counter == 0: 
-                best_threshold = valid_result['threshold']
-            if early_stopping.early_stop:
-                tqdm.write("\nEarly stopping triggered") 
-                break
-
-            net.train()
-    pbar.close()
-
-    end_time = time.time()
-    actual_steps = step + 1
-    running_time = (end_time - start_time) / actual_steps
-    allocated_memory = torch.cuda.max_memory_allocated(device)  # max_
-    net = loading_lora_checkpoint(net, path + checkpoint_name + '_checkpoint.pt', args)
-    trainable_num = count_parameters(net)
-    
-    net.eval()
-    net.merge_net()
-    test_result = validate(net, loader_test, device, iftest=True, threshold=best_threshold)
-    test_result.update({
-        'trainable_num': trainable_num,
-        'memory': allocated_memory,
-        'time': running_time
-    })
-
-    tea_res_dir = os.path.join(args.root, 'results')
-    os.makedirs(tea_res_dir, exist_ok=True)
-    tea_res_save_path = os.path.join(tea_res_dir, checkpoint_name + '_result.json')
-    serializable_res = {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in test_result.items()}
-    with open(tea_res_save_path, 'w') as f:
-        json.dump(serializable_res, f, indent=4)
-    return net
-def cross_kd_stu(args, fold_idx):
-    teacher_checkpoint_name = args.ft_dataset + '_' + args.ranklist + '_' + args.model_config + '_CrossKD_teacher' + '_seed' + str(args.seed)
-    teacher_checkpoint_path = os.path.join(args.root, 'pretrained_checkpoint', teacher_checkpoint_name + '_checkpoint.pt')
-    dataset_train, dataset_valid, dataset_test = ECGfinetunedataset_loading(args=args, fold_idx = fold_idx)
-    actual_input_length = dataset_train[0][0].shape[-1]
-    if os.path.exists(teacher_checkpoint_path):
-        print(f"--- Teacher checkpoint found at {teacher_checkpoint_path}. Loading existing model. ---")
-        teacher_net, _ = model_config_initializations(args, input_length=actual_input_length)
-        teacher_net = loading_lora_checkpoint(teacher_net, teacher_checkpoint_path, args)
-        teacher_net.eval()
-        if hasattr(teacher_net, 'merge_net'):
-            teacher_net.merge_net()
-    else:
-        print("--- Teacher checkpoint not found. Starting teacher training... ---")
-        teacher_net = cross_kd_tea(args)
-
-    teacher_net.eval() # 教师模型固定，只用于推理
-    for param in teacher_net.parameters():
-        param.requires_grad = False
-    args.ranklist = 'FT'
-    device = args.device
-    path = args.root + '/pretrained_checkpoint/'
-    batch_size = args.batch_size
-    args.learning_rate = 0.002
-    T = args.kd_temperature      
-    alpha = args.kd_alpha    
-    setup_seed(args.seed)
-    model_config = '_student_KD_Cross_' + args.model_config + '_' + args.tea_ranklist  + '_AblationLSconv'
-    checkpoint_name = args.ft_dataset + model_config  + '_seed' + str(args.seed)
-    prestu_checkpoint = "CODE15_Pretrain_student"
-    prestu_path = os.path.join(path, prestu_checkpoint + '_checkpoint.pt')
-
-    ## dataset loading
-    loader_train = DataLoader(dataset_train, batch_size=batch_size, shuffle=True, num_workers=0)
-    loader_valid = DataLoader(dataset_valid, batch_size=batch_size, shuffle=True, num_workers=0)
-    loader_test = DataLoader(dataset_test, batch_size=batch_size, shuffle=True, num_workers=0)
-    
-    label_iter = iter(loader_train)
-    iteration = len(loader_train) * args.ft_epoch
-    if args.ft_dataset in ['WFDB_Ga', 'WFDB_ChapmanShaoxing']:
-        iteration = iteration * 2
-
-    start_time = time.time() 
-    num_layers, complexity = 9, 64 
-    net = LSTransECG(nOUT=args.num_class, out_channels=complexity, in_channels=12, 
-                             input_length=actual_input_length, 
-                             num_layers=num_layers, rank_list=0,
-                             use_static_conv=args.static_conv).to(device)
-    net = load_pretrained_model(net, prestu_path, args)
-    optimizer = optim.AdamW(net.parameters(), lr=args.learning_rate)
-    
-    early_stopping = EarlyStopping(patience=args.patience, verbose=True, 
-                                   dataset_name=checkpoint_name, delta=0, args=args)
-    my_lr_scheduler = get_linear_schedule_with_warmup(optimizer, int(iteration*0.01), iteration, last_epoch=-1)
-
-    net.train()
-    best_threshold = 0.5 * np.ones(args.num_class)
-    pbar = tqdm(range(iteration), desc=f"KD Student Training")
-    for step in pbar:
-        try:
-            images, labels = next(label_iter)
-        except StopIteration:
-            label_iter = iter(loader_train)
-            images, labels = next(label_iter)
-
-        images = images.float().to(device, non_blocking=True)
-        labels = labels.float().to(device, non_blocking=True)
-        images, labels = Cutmix_ECG_student(images, labels, device)
-        with torch.no_grad():
-            teacher_input = images.unsqueeze(2) if images.dim() == 3 else images
-            teacher_outputs = teacher_net(teacher_input)
-        if hasattr(args, 'leads_for_student'):
-            images = mask_ecg_signal(images, args.leads_for_student)
-        optimizer.zero_grad()
-        outputs = net(images)
-
-        # 硬标签损失
-        loss_hard = F.binary_cross_entropy_with_logits(outputs, labels)
-        # 带温度系数的软标签蒸馏损失
-        student_logits_T = outputs / T
-        teacher_logits_T = teacher_outputs / T
-        loss_soft = F.binary_cross_entropy_with_logits(student_logits_T, teacher_logits_T.sigmoid()) * (T * T)
-        loss = (1.0 - alpha) * loss_hard + alpha * loss_soft #+ beta * loss_feat
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(list(net.parameters()), max_norm=1.0)
-        optimizer.step()
-        my_lr_scheduler.step()
-        current_loss = loss.item()
-
-        pbar.set_postfix({
-            'L_all': f'{current_loss:.3f}', 
-            'L_hard': f'{loss_hard.item():.3f}',
-            'L_soft': f'{loss_soft.item():.3f}'
-        })
+        if teacher_net is not None:
+            pbar.set_postfix({'L_all': f'{current_loss:.3f}', 'L_hard': f'{loss_hard.item():.3f}', 'L_soft': f'{loss_soft.item():.3f}'})
+        else:
+            pbar.set_postfix({'L_all': f'{current_loss:.3f}'})
 
         if (step + 1) % len(loader_train) == 0:
             net.eval()
             valid_result = validate(net, loader_valid, threshold=0.5 * np.ones(args.num_class), device=device)
             early_stopping(1 / valid_result['Map_value'], net)
-            if early_stopping.counter == 0: 
+            if early_stopping.counter == 0:
                 best_threshold = valid_result['threshold']
             if early_stopping.early_stop:
-                tqdm.write("\nEarly stopping triggered") 
+                tqdm.write("\nEarly stopping triggered")
                 break
             net.train()
-        
+
     pbar.close()
 
     end_time = time.time()
-    actual_steps = step + 1
-    running_time = (end_time - start_time) / actual_steps
-    allocated_memory = torch.cuda.max_memory_allocated(device)  # max_
-    net.load_state_dict(torch.load(path + checkpoint_name + '_checkpoint.pt', map_location=device))
+    running_time = (end_time - start_time) / (step + 1)
+    allocated_memory = torch.cuda.max_memory_allocated(device)
+    net.load_state_dict(torch.load(os.path.join(path, checkpoint_name + '_checkpoint.pt'), map_location=device))
     trainable_num = count_parameters(net)
 
     net.eval()
@@ -699,5 +402,4 @@ def cross_kd_stu(args, fold_idx):
         'memory': allocated_memory,
         'time': running_time
     })
-    
     return test_result

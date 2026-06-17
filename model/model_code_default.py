@@ -530,7 +530,7 @@ class NN_PCG(nn.Module):
 class LSTrans_default(nn.Module):
     def __init__(self,nOUT,out_channels,in_channels,input_length,
                 num_layers,num_encoder_layers=1,
-                rank_list=32,information='fisher', use_static_conv=False, 
+                rank_list=32,information='fisher', 
                 dropout_coef=0.2, pos_max_len=200):
         super(LSTrans_default,self).__init__()
 
@@ -553,8 +553,7 @@ class LSTrans_default(nn.Module):
             input_length=self.input_length,
             embed_dim=[64, 128, 256, out_channels],  
             rank_list=self.rank_list[0:4],
-            information=information,
-            use_static_conv=use_static_conv
+            information=information
         )
 
         # transformer layers
@@ -569,14 +568,14 @@ class LSTrans_default(nn.Module):
             for i in range(self.num_transformer_layers // 3)
         ])
 
-        # # classifier layers
-        # self.classifier = nn.ModuleList([
-        #     Linear(out_channels, out_channels, r=self.rank_list[num_layers-2-i], merge_weights=False, information=information, dropout_coef=dropout_coef) 
-        #     for i in range(self.num_classifier_layers - 1)
-        # ])
-        # self.classifier += nn.ModuleList([
-        #     Linear(out_channels, nOUT, r=0, merge_weights=False, information=information, dropout_coef=dropout_coef)
-        # ])
+        # classifier layers
+        self.classifier = nn.ModuleList([
+            Linear(out_channels, out_channels, r=self.rank_list[num_layers-2-i], merge_weights=False, information=information, dropout_coef=dropout_coef) 
+            for i in range(self.num_classifier_layers - 1)
+        ])
+        self.classifier += nn.ModuleList([
+            Linear(out_channels, nOUT, r=0, merge_weights=False, information=information, dropout_coef=dropout_coef)
+        ])
         
         self.pool = nn.AdaptiveMaxPool1d(output_size=1)
 
@@ -636,7 +635,6 @@ class LSTransECG(nn.Module):
     def __init__(self,nOUT,out_channels,in_channels,input_length,
                  num_layers,num_encoder_layers=1,
                  rank_list=32,information='fisher',
-                 use_static_conv=False,
                  dropout_coef=0.2,
                  pos_max_len=200,
                  backbone=LSTrans_default):
@@ -652,7 +650,6 @@ class LSTransECG(nn.Module):
                                 input_length,
                                 num_layers,num_encoder_layers,
                                 rank_list,information, 
-                                use_static_conv, 
                                 dropout_coef, pos_max_len)
         # classifier layers
         self.classifier = nn.ModuleList([
@@ -702,7 +699,6 @@ class LSTransPCG(nn.Module):
     def __init__(self, nOUT, out_channels,in_channels,input_length,
                 num_layers,num_encoder_layers=1, 
                 rank_list=32,information='fisher',
-                use_static_conv=False, 
                 dropout_coef=0.2,
                 loc_dim=5,backbone=LSTrans_default,
                 pos_max_len=1000):
@@ -717,7 +713,6 @@ class LSTransPCG(nn.Module):
                                 input_length,
                                 num_layers,num_encoder_layers,
                                 rank_list,information, 
-                                use_static_conv, 
                                 dropout_coef,pos_max_len)
         self.loc_branch = nn.Sequential(
             nn.Linear(loc_dim, 32),
@@ -836,7 +831,6 @@ class MultimodalLSTransNet(nn.Module):
                  ecg_inchannels, pcg_inchannels, input_length,
                  num_layers,num_encoder_layers=1,
                  rank_list=32,information='fisher',
-                 use_static_conv=False,
                  dropout_coef=0.2,loc_dim=5,expert_dim=3):
         super(MultimodalLSTransNet, self).__init__()
 
@@ -855,7 +849,6 @@ class MultimodalLSTransNet(nn.Module):
             num_encoder_layers=num_encoder_layers, 
             rank_list=self.rank_list, 
             information=information,
-            use_static_conv=use_static_conv,
             dropout_coef=dropout_coef,
             pos_max_len=200
         )
@@ -868,7 +861,6 @@ class MultimodalLSTransNet(nn.Module):
             num_encoder_layers=num_encoder_layers, 
             rank_list=self.rank_list, 
             information=information,
-            use_static_conv=use_static_conv,
             dropout_coef=dropout_coef,
             loc_dim=loc_dim,
             pos_max_len=1000

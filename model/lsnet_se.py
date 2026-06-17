@@ -25,37 +25,6 @@ class SqueezeExcite1d(nn.Module):
         x_se = self.fc2(x_se)
         return x * self.gate(x_se)
 
-class StaticConv1D(nn.Module):
-    """
-    LSConv1D 的静态卷积替代版本，用于消融实验。
-    它使用标准的深度可分离卷积。
-    """
-    def __init__(self, dim, r=16, information='fisher'):
-        super().__init__()
-        self.conv = Conv1d_BN(dim, dim, kernel_size=3, padding=1, groups=dim, r=r, information=information)
-        self.bn = nn.BatchNorm1d(dim)
-
-    def forward(self, x):
-        out = self.conv(x)
-        return self.bn(out) + x
-
-    def compute_grad_layer(self):
-        if hasattr(self.conv.c, 'estimate_grad'):
-             return [self.conv.c.estimate_grad()]
-        return []
-
-    def reset_rank_state(self):
-        if hasattr(self.conv.c, 'enable_deactivation'):
-            self.conv.c.enable_deactivation = not self.conv.c.enable_deactivation
-
-    def merge_layer(self):
-        if hasattr(self.conv.c, 'merge'):
-            self.conv.c.merge()
-
-    def freeze_A_grad_layer(self):
-        if hasattr(self.conv.c, 'lora_A'):
-            self.conv.c.lora_A.requires_grad = False
-
 class LoRAConv1d(ConvLoRA_split):
     def __init__(self, *args, **kwargs):
         super(LoRAConv1d, self).__init__(nn.Conv1d, *args, **kwargs)
@@ -252,7 +221,7 @@ class LSConv1D(nn.Module):
 
 class Block1D(nn.Module):    
     def __init__(self, ed, kd, nh=8, ar=4, resolution=0, stage=-1, depth=-1, 
-                r=16, information='fisher', use_static_conv = False):
+                r=16, information='fisher'):
         super().__init__()
         if depth % 2 == 0:
             self.mixer = RepVGGDW1D(ed, r=r, information=information)
@@ -262,10 +231,7 @@ class Block1D(nn.Module):
             if stage == 3:
                 self.mixer = Residual(Attention1D(ed, kd, nh, ar, resolution=resolution, r=r, information=information))
             else:
-                if use_static_conv:
-                    self.mixer = StaticConv1D(ed, r=r, information=information)
-                else:
-                    self.mixer = LSConv1D(ed, r=r, information=information)
+                self.mixer = LSConv1D(ed, r=r, information=information)
 
         self.ffn = Residual(FFN1D(ed, int(ed * 2), r=r, information=information))
 
@@ -307,8 +273,7 @@ class LSNet(nn.Module):
                  depth=[1, 2, 8, 10],
                  num_heads=[3, 3, 3, 4],
                  rank_list=[16, 32, 64, 128],
-                 information='fisher',
-                 use_static_conv = False):
+                 information='fisher'):
         super().__init__()
         self.rank_list = rank_list
         # print(f"Rank list: {self.rank_list}")
@@ -335,7 +300,7 @@ class LSNet(nn.Module):
             for d in range(dpth):
                 blocks[i].append(
                     Block1D(ed, kd, nh, ar, resolution=self.resolution, stage=i, depth=d, 
-                            r=self.rank_list[i], information=information, use_static_conv=use_static_conv)
+                            r=self.rank_list[i], information=information)
                 )
             if i != len(depth) - 1:
                 blk = blocks[i+1]
