@@ -6,13 +6,13 @@ L-LSTrans(Hetero).pdf
 L-LSTrans(Homo).pdf
 LSTrans_framework.pdf
 LSTrans_KD_config.pdf
-# multimodel code
-model/multimodel.md
-model/prior_utils.py
-pipeline/mm_pipeline.py
-pipeline/mm_pretrain_EPHNOGRAM.py
-pipeline/pipeline_pretrain_pcg.py
-tools/mmdatasets_utils.py
-main_mm.py
-main_pcg.py
-main.sh
+# # multimodel code
+# model/multimodel.md
+# model/prior_utils.py
+# pipeline/mm_pipeline.py
+# pipeline/mm_pretrain_EPHNOGRAM.py
+# pipeline/pipeline_pretrain_pcg.py
+# tools/mmdatasets_utils.py
+# main_mm.py
+# main_pcg.py
+# main.sh
