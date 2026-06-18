@@ -106,7 +106,7 @@ class FINETUNEDataset(torch.utils.data.Dataset):
         trace = self._pad_or_crop(self.records[idx])
         return torch.tensor(trace, dtype=torch.float32), torch.tensor(self.labels[idx], dtype=torch.float32) 
 def ECGfinetunedataset_loading(args, fold_idx=0):
-    data_path = os.path.join(args.root, 'Preprocessed_dataset', 
+    data_path = os.path.join(args.dataset_dir, 
                              f'class_sepe{args.num_class}_dataset_{args.ft_dataset}_32.hdf5')
 
     full_dataset = FINETUNEDataset(
@@ -119,7 +119,7 @@ def ECGfinetunedataset_loading(args, fold_idx=0):
     total_len = len(full_dataset)
 
     indices = np.arange(total_len)
-    kf = KFold(n_splits=5, shuffle=True, random_state=args.seed)
+    kf = KFold(n_splits=args.kfold, shuffle=True, random_state=args.seed)
     splits = list(kf.split(indices))
     train_val_idx, test_idx = splits[fold_idx]
     val_size = int(len(train_val_idx) * 0.2)
@@ -569,7 +569,7 @@ def MultimodalDataset_loading(args, fold_idx=0):
     # splits = list(kf.split(indices, groups=groups))
     # train_val_idx, test_idx = splits[fold_idx]
     from sklearn.model_selection import GroupKFold
-    gkf = GroupKFold(n_splits=5)
+    gkf = GroupKFold(n_splits=args.kfold)
     splits = list(gkf.split(indices, groups=groups))
     train_val_idx, test_idx = splits[fold_idx]
     train_val_groups = groups[train_val_idx]
@@ -607,30 +607,30 @@ def MultimodalDataset_loading(args, fold_idx=0):
           
     return dataset_train, dataset_valid, dataset_test
 
-# run_preprocessing.py
-from mmdatasets_utils import MultimodalProcessor
+# # run_preprocessing.py
+# from mmdatasets_utils import MultimodalProcessor
 
-if __name__ == '__main__':
-    # 实例化数据转换核心
-    processor = MultimodalProcessor(
-        ecg_target_hz=400, 
-        pcg_target_hz=4000, 
-        ecg_max_len=4000, 
-        pcg_max_len=40000
-    )
+# if __name__ == '__main__':
+#     # 实例化数据转换核心
+#     processor = MultimodalProcessor(
+#         ecg_target_hz=400, 
+#         pcg_target_hz=4000, 
+#         ecg_max_len=4000, 
+#         pcg_max_len=40000
+#     )
 
-    # 1. 预处理 Cardiology2016 
-    # 原始数据集解压路径: ./data/challenge-2016/training-a
-    processor.process_cardiology2016(
-        data_dir='./data/cardiology2016/classification-of-heart-sound-recordings-the-physionet-computing-in-cardiology-challenge-2016-1.0.0',
-        output_hdf5='./Preprocessed_dataset/mm_dataset_cardiology2016.hdf5'
-    )
+#     # 1. 预处理 Cardiology2016 
+#     # 原始数据集解压路径: ./data/challenge-2016/training-a
+#     processor.process_cardiology2016(
+#         data_dir='./data/cardiology2016/classification-of-heart-sound-recordings-the-physionet-computing-in-cardiology-challenge-2016-1.0.0',
+#         output_hdf5='./Preprocessed_dataset/mm_dataset_cardiology2016.hdf5'
+#     )
 
-    # 2. 预处理 EPHNOGRAM
-    # 包含 .mat 原始长录音文件的路径: ./data/EPHNOGRAM/MATfiles
-    processor.process_ephnogram(
-        data_dir='./data/ephnogram/MAT',
-        output_hdf5='./Preprocessed_dataset/mm_dataset_ephnogram.hdf5',
-        segment_len_sec=10, # 每 10s 切分一段片段
-        overlap_sec=5       # 步长 5s 重叠切分
-    )
+#     # 2. 预处理 EPHNOGRAM
+#     # 包含 .mat 原始长录音文件的路径: ./data/EPHNOGRAM/MATfiles
+#     processor.process_ephnogram(
+#         data_dir='./data/ephnogram/MAT',
+#         output_hdf5='./Preprocessed_dataset/mm_dataset_ephnogram.hdf5',
+#         segment_len_sec=10, # 每 10s 切分一段片段
+#         overlap_sec=5       # 步长 5s 重叠切分
+#     )

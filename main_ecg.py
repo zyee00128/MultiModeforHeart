@@ -41,10 +41,13 @@ def get_args():
     ## 路径与环境设定 (Paths & Environment Settings)
     parser.add_argument('--root', type=str, default='/home/xcy/zy/LSTrans', 
                         help='Project root directory (stores checkpoints, results)')
-    parser.add_argument('--pretrain_dataset', type=str, default='/data2/zy/LSTrans/data_pretrain', 
+    parser.add_argument('--dataset_dir', type=str, default='/data/xcy_group/zy/Data/G12EC_PTBXL_Ningbo_Chapman')
+    parser.add_argument('--pretrain_dataset', type=str, default='/data/xcy_group/zy/Data/Code15_preprocessing', 
                         help='Path to HDF5 pre-training dataset directory')    
     parser.add_argument('--device', type=str, default='cuda:0', 
                         help='Target GPU/CPU computation device') 
+    parser.add_argument('--preload_devices', type=str, nargs='+', default=['cuda:0', 'cuda:1'], 
+                        help='预加载数据到的设备 (Device to preload data onto, e.g., "cuda:0" or "cpu")')
     parser.add_argument('--seed', type=int, default=42, 
                         help='Random seed for reproducibility')
     
@@ -69,9 +72,7 @@ def get_args():
     ## 蒸馏参数 (Distillation Hyperparameters)
     parser.add_argument('--kd_temperature', type=float, default=5.0, help='KD Temperature scaling coefficient')
     parser.add_argument('--kd_alpha', type=float, default=0.5, help='Hard-to-Soft label weighting (alpha)')
-    
-    parser.add_argument('--static_conv', type=bool, default=False, help='Static convolution layer replacement')
-    parser.add_argument('--kfold', action='store_true', default=False, help='Perform 5-fold cross-validation instead of single fold')
+    parser.add_argument('--kfold', type=int, default=5, help='Number of folds for cross-validation')
 
     args = parser.parse_args()
     return args
@@ -131,7 +132,7 @@ def run_kfold_experiment(args):
         ablation_suffix += f"_even_{args.ablation_even}"
 
     print("\n" + "="*50)
-    print("        LSNet 5-Fold Experiment Execution         ")
+    print("        LSNet K-Fold Experiment Execution         ")
     print("="*50)
     print(f"Mode         : {args.mode}")
     print(f"Teacher FT   : {args.ranklist}")
@@ -147,8 +148,8 @@ def run_kfold_experiment(args):
         print(f">> Dataset: {args.ft_dataset} | Total classes: {args.num_class}")
         
         all_fold_results = []
-        for fold in range(5):
-            print(f"\n>>> Fold {fold+1}/5 <<<")
+        for fold in range(args.kfold):
+            print(f"\n>>> Fold {fold+1}/{args.kfold} <<<")
             results = train_student(args, fold_idx=fold)
             all_fold_results.append(results)
             torch.cuda.empty_cache()
@@ -169,7 +170,7 @@ def run_kfold_experiment(args):
         with open(save_path, 'w') as f:
             json.dump(final_metrics, f, indent=4)
             
-        print(f"\n[Success] 5-Fold results saved to: {save_path}")
+        print(f"\n[Success] K-Fold results saved to: {save_path}")
 
 if __name__ == '__main__':
     args = get_args()

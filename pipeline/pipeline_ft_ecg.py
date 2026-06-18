@@ -287,7 +287,7 @@ def train_student(args, fold_idx=0):
 
     dataset_train, dataset_valid, dataset_test = ECGfinetunedataset_loading(args=args, fold_idx=fold_idx)
     actual_input_length = dataset_train[0][0].shape[-1]
-    
+
     # 尝试初始化/加载教师模型（KD 模式）
     teacher_net = None
     if args.mode in ['homo', 'hetero']:
@@ -308,7 +308,9 @@ def train_student(args, fold_idx=0):
         teacher_net.eval()
         for param in teacher_net.parameters():
             param.requires_grad = False
-
+    
+    original_ranklist = args.ranklist
+    args.ranklist = 'ft'
     # 建立学生模型和相关训练参数
     loader_train = DataLoader(dataset_train, batch_size=batch_size, shuffle=True, num_workers=0)
     loader_valid = DataLoader(dataset_valid, batch_size=batch_size, shuffle=True, num_workers=0)
@@ -402,4 +404,6 @@ def train_student(args, fold_idx=0):
         'memory': allocated_memory,
         'time': running_time
     })
+
+    args.ranklist = original_ranklist
     return test_result

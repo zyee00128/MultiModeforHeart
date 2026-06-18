@@ -127,68 +127,67 @@ def print_result(loss, label, predict, datatype, thres = None):
     performance_table.update({'yloss': loss})
     performance_table.update({'threshold': thres})
     
-    # 开始美化打印
-    print("=" * 70)
-    print(f"  [EVALUATION REPORT] - {datatype.upper()} PHASE ")
-    print("=" * 70)
+    # # 开始美化打印
+    # print("=" * 70)
+    # print(f"  [EVALUATION REPORT] - {datatype.upper()} PHASE ")
+    # print("=" * 70)
     
-    # ---------------------------------------------------------
-    # 类别 1: 基础损失与辅助配置指标
-    # ---------------------------------------------------------
-    print("\n>>> [1. Loss & Configurations / 基础损失与辅助配置]")
-    print(f"  - Epoch Loss (损失值):             {loss:.6f}")
-    print(f"  - Decision Thresholds (决策阈值):  {np.array2string(thres, precision=4, separator=', ')}")
+    # # ---------------------------------------------------------
+    # # 类别 1: 基础损失与辅助配置指标
+    # # ---------------------------------------------------------
+    # print("\n>>> [1. Loss & Configurations / 基础损失与辅助配置]")
+    # print(f"  - Epoch Loss (损失值):             {loss:.6f}")
+    # print(f"  - Decision Thresholds (决策阈值):  {np.array2string(thres, precision=4, separator=', ')}")
     
-    # ---------------------------------------------------------
-    # 类别 2: 连续概率与排序评估指标 (直接由 Logit 计算，不依赖硬二值化阈值)
-    # ---------------------------------------------------------
-    print("\n>>> [2. Probability & Ranking Metrics / 连续概率与排序评估 (不依赖阈值)]")
-    # Macro AUC: 宏观受试者工作特征曲线下面积。反映模型对各类别区分能力的平均水平。
-    print(f"  - Macro ROC-AUC (宏观 AUC):        {performance_table['auc']:.4f}")
+    # # ---------------------------------------------------------
+    # # 类别 2: 连续概率与排序评估指标 (直接由 Logit 计算，不依赖硬二值化阈值)
+    # # ---------------------------------------------------------
+    # print("\n>>> [2. Probability & Ranking Metrics / 连续概率与排序评估 (不依赖阈值)]")
+    # # Macro AUC: 宏观受试者工作特征曲线下面积。反映模型对各类别区分能力的平均水平。
+    # print(f"  - Macro ROC-AUC:        {performance_table['auc']:.4f}")
     
-    # Mean AP (mAP): 平均精准度。评估多标签排序推荐能力，对正样本召回位置敏感。
-    print(f"  - Mean Average Precision (mAP):   {performance_table['Map_value']:.2f}%")
+    # # Mean AP (mAP): 平均精准度。评估多标签排序推荐能力，对正样本召回位置敏感。
+    # print(f"  - Mean Average Precision:   {performance_table['Map_value']:.2f}%")
     
-    # Label Ranking Loss: 标签排序损失。度量排序错误的标签对比例，值越低代表预测真实的标签越靠前。
-    print(f"  - Label Ranking Loss (越低越好):   {performance_table['ranking']:.4f}")
+    # # Label Ranking Loss: 标签排序损失。度量排序错误的标签对比例，值越低代表预测真实的标签越靠前。
+    # print(f"  - Label Ranking Loss:   {performance_table['ranking']:.4f}")
     
-    # Coverage Error: 覆盖误差。平均需要预测前多少个高置信度标签才能完整覆盖所有真实标签。
-    print(f"  - Coverage Error (越低越好):       {performance_table['Coverage']:.4f}")
+    # # Coverage Error: 覆盖误差。平均需要预测前多少个高置信度标签才能完整覆盖所有真实标签。
+    # print(f"  - Coverage Error:        {performance_table['Coverage']:.4f}")
+    # # ---------------------------------------------------------
+    # # 类别 3: 硬决策分类指标 (由概率通过指定阈值二值化后计算)
+    # # ---------------------------------------------------------
+    # print("\n>>> [3. Binary Classification Metrics / 硬决策二分类指标 (依赖阈值二值化)]")
+    # # Subset Accuracy: 子集准确率（样本完全匹配率）。多标签场景下，必须所有标签全对才算正确，指标最严苛。
+    # print(f"  - Subset Accuracy:    {performance_table['acc']:.4f}")
     
-    # ---------------------------------------------------------
-    # 类别 3: 硬决策分类指标 (由概率通过指定阈值二值化后计算)
-    # ---------------------------------------------------------
-    print("\n>>> [3. Binary Classification Metrics / 硬决策二分类指标 (依赖阈值二值化)]")
-    # Subset Accuracy: 子集准确率（样本完全匹配率）。多标签场景下，必须所有标签全对才算正确，指标最严苛。
-    print(f"  - Subset Accuracy (完全匹配率):    {performance_table['acc']:.4f}")
+    # # Hamming Loss: 汉明损失。错分标签比例（包括漏诊和误诊），对标签稀疏任务较敏感。越低越好。
+    # print(f"  - Hamming Loss: {performance_table['hamming']:.4f}")
     
-    # Hamming Loss: 汉明损失。错分标签比例（包括漏诊和误诊），对标签稀疏任务较敏感。越低越好。
-    print(f"  - Hamming Loss (汉明损失 - 越低越好): {performance_table['hamming']:.4f}")
+    # # Macro F1-score: 传统的宏观 F1 分数 (beta=1)，精准率与召回率的等权重调和平均。
+    # print(f"  - Macro F1-score:  {performance_table['F1score']:.4f}")
     
-    # Macro F1-score: 传统的宏观 F1 分数 (beta=1)，精准率与召回率的等权重调和平均。
-    print(f"  - Macro F1-score (F1 值 - beta=1):  {performance_table['F1score']:.4f}")
+    # # Macro F_beta-score (默认 beta=2): 加权 F 分数，更侧重于召回率 (Recall)，符合心电图疾病筛查防漏诊的要求。
+    # print(f"  - Macro F_beta-score: {performance_table['F1score_b']:.4f}")
     
-    # Macro F_beta-score (默认 beta=2): 加权 F 分数，更侧重于召回率 (Recall)，符合心电图疾病筛查防漏诊的要求。
-    print(f"  - Macro F_beta-score (优先召回 - beta=2): {performance_table['F1score_b']:.4f}")
+    # # G_beta-score: Challenge赛事指标。综合权衡了漏诊(FN)和误诊(FP)非平衡代价的乘积项评估。
+    # print(f"  - Macro G_beta-score:   {performance_table['Gscore_b']:.4f}")
     
-    # G_beta-score: Challenge赛事指标。综合权衡了漏诊(FN)和误诊(FP)非平衡代价的乘积项评估。
-    print(f"  - Macro G_beta-score (几何综合评估):   {performance_table['Gscore_b']:.4f}")
-    
-    # ---------------------------------------------------------
-    # 类别 4: 逐类别细分指标 (辅助分析各类心电异常的特征捕捉情况)
-    # ---------------------------------------------------------
-    print("\n>>> [4. Class-wise Detailed Metrics / 逐类别细分评估]")
-    num_classes = label.shape[1]
-    for c in range(num_classes):
-        print(f"  Class {c:02d}:")
-        print(f"    * Threshold (分类阈值):    {thres[c]:.4f}")
-        print(f"    * ROC-AUC (曲线下面积):   {performance_table['auc_class'][c]:.4f}")
-        print(f"    * Average Precision (AP): {performance_table['map_class'][c]:.2f}%")
-        print(f"    * F1-score (F1 标准值):    {performance_table['F1score_class'][c]:.4f}")
-        print(f"    * F_beta-score (F_beta):  {performance_table['F1score_b_class'][c]:.4f}")
-        print(f"    * G_beta-score (G_beta):  {performance_table['Gscore_b_class'][c]:.4f}")
+    # # ---------------------------------------------------------
+    # # 类别 4: 逐类别细分指标 (辅助分析各类心电异常的特征捕捉情况)
+    # # ---------------------------------------------------------
+    # print("\n>>> [4. Class-wise Detailed Metrics / 逐类别细分评估]")
+    # num_classes = label.shape[1]
+    # for c in range(num_classes):
+    #     print(f"  Class {c:02d}:")
+    #     print(f"    * Threshold (分类阈值):    {thres[c]:.4f}")
+    #     print(f"    * ROC-AUC (曲线下面积):   {performance_table['auc_class'][c]:.4f}")
+    #     print(f"    * Average Precision (AP): {performance_table['map_class'][c]:.2f}%")
+    #     print(f"    * F1-score (F1 标准值):    {performance_table['F1score_class'][c]:.4f}")
+    #     print(f"    * F_beta-score (F_beta):  {performance_table['F1score_b_class'][c]:.4f}")
+    #     print(f"    * G_beta-score (G_beta):  {performance_table['Gscore_b_class'][c]:.4f}")
         
-    print("=" * 70 + "\n")
+    # print("=" * 70 + "\n")
     
     return performance_table
 
